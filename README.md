@@ -15,6 +15,13 @@ Aplicación **local** en Node.js que se conecta al chat de **TikTok Live**, mode
 * [Moderación](#moderación)
 * [Cola TTS](#cola-tts)
 * [Piper (motor TTS opcional)](#piper-motor-tts-opcional)
+
+  * [Piper Quick Start](#piper-quick-start-sin-fallos)
+  * [Instalación de Piper (Windows 11)](#instalación-de-piper-windows-11)
+  * [Descargar un modelo de voz](#descargar-un-modelo-de-voz)
+  * [Smoke test (prueba rápida)](#smoke-test-prueba-rápida)
+  * [Configurar Piper en el dashboard](#configurar-piper-en-el-dashboard)
+  * [Errores comunes](#errores-comunes)
 * [API HTTP](#api-http)
 * [Socket.IO](#socketio)
 * [UI (Dashboard)](#ui-dashboard)
@@ -89,11 +96,12 @@ data/piper/
 * Windows 10/11 (orientado a Windows 11)
 * Node.js **18+** (probado con Node 25)
 * Nombre de usuario de TikTok (para conectar a Live)
-* Para Piper (opcional):
 
-  * **Python 3.12 o 3.13 x64** (recomendado)
-  * Paquete `piper-tts` instalado en un venv del proyecto
-  * Modelo de voz Piper (`.onnx` + `.onnx.json`)
+**Para Piper (opcional):**
+
+* **Python 3.12 o 3.13 x64** (recomendado)
+* Paquete `piper-tts` instalado (idealmente en un venv del proyecto)
+* Modelo de voz Piper (**siempre** `.onnx` + `.onnx.json`)
 
 ## Ejecución local
 
@@ -145,7 +153,7 @@ Ejemplo (con defaults + Piper):
 }
 ```
 
-> Nota: los nombres exactos de campos de Piper (`pythonCmd`, `modelPath`, etc.) corresponden a la integración descrita (panel Opciones y guardado en `settings.json`).
+> Nota: los campos `ttsVoice/ttsRate` aplican principalmente a `say`. Para Piper se usan los campos dentro de `piper`.
 
 ### Campos (resumen)
 
@@ -157,7 +165,7 @@ Ejemplo (con defaults + Piper):
 * **perUserCooldownMs:** cooldown por usuario
 * **maxQueue:** tamaño máximo de cola
 * **maxChars / maxWords:** límites del mensaje a encolar
-* **ttsVoice / ttsRate:** (solo `say`) selección de voz y velocidad
+* **ttsVoice / ttsRate:** (principalmente `say`) selección de voz y velocidad
 * **piper.***: (solo `piper`) configuración de CLI/modelo
 * **autoBan:** configuración de strikes y ban automático
 
@@ -240,9 +248,25 @@ Piper está integrado como motor alternativo. Se invoca mediante **Piper CLI** p
 ### Cambios principales (implementación)
 
 * Motor TTS configurable + Piper CLI (WAV + SoundPlayer) en `server.mjs`
-* Nuevos campos de Piper en el panel lateral **Opciones → TTS** (`index.html`)
-* Lógica UI para mostrar/ocultar ajustes de Piper y guardar en runtime (`app.js`)
+* Nuevos campos de Piper en el panel lateral **Opciones → TTS** (`public/index.html`)
+* Lógica UI para mostrar/ocultar ajustes de Piper y guardar en runtime (`public/app.js`)
 * Defaults persistidos en `data/settings.json`
+
+### Piper Quick Start
+
+Para usar Piper en Windows se requieren **3 cosas**:
+
+1. **Piper instalado** (`piper-tts`)
+2. **Modelo descargado** (**siempre** `.onnx` + `.onnx.json`)
+3. **`pythonCmd` correcto** (debe apuntar al Python que tiene Piper instalado)
+
+✅ **Regla de oro:** **NO uses `py`** como `pythonCmd`.
+`py` (Python Launcher) normalmente ejecuta el Python global y puede **ignorar el venv**, causando errores tipo “no se encuentra Piper” aunque sí esté instalado.
+
+**Configuración recomendada:**
+
+* `pythonCmd`: `.\.venv\Scripts\python.exe`
+* `modelPath`: `.\data\piper\<modelo>.onnx`
 
 ### Instalación de Piper (Windows 11)
 
@@ -271,29 +295,45 @@ Verifica:
 python -m piper --help
 ```
 
-### Descargar un modelo de voz (.onnx + .onnx.json)
+### Descargar un modelo de voz
 
-Crea carpeta recomendada:
+Piper requiere **dos archivos** por voz. Si falta el `.onnx.json`, la síntesis fallará.
+
+1. Crea carpeta recomendada:
 
 ```powershell
 mkdir .\data\piper -Force | Out-Null
 ```
 
-Coloca ambos archivos del modelo en `data/piper/`:
-
-* `es_MX-claude-high.onnx`
-* `es_MX-claude-high.onnx.json`
-
-> Importante: **Piper requiere ambos** (`.onnx` y `.onnx.json`). Si falta el `.json`, fallará la síntesis.
-
-### Probar Piper manualmente (recomendado)
-
-Con el venv activo:
+2. Ejemplo de descarga (es_MX-claude-high):
 
 ```powershell
-"Hola, prueba de Piper." | python -m piper `
+Invoke-WebRequest `
+  -Uri "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_MX/claude/high/es_MX-claude-high.onnx" `
+  -OutFile ".\data\piper\es_MX-claude-high.onnx"
+
+Invoke-WebRequest `
+  -Uri "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_MX/claude/high/es_MX-claude-high.onnx.json" `
+  -OutFile ".\data\piper\es_MX-claude-high.onnx.json"
+```
+
+3. Verifica:
+
+```powershell
+Test-Path .\data\piper\es_MX-claude-high.onnx
+Test-Path .\data\piper\es_MX-claude-high.onnx.json
+```
+
+Ambos deben dar `True`.
+
+### Smoke test (prueba rápida)
+
+Antes de configurar el dashboard, valida que Piper + modelo funcionan:
+
+```powershell
+"Hola desde Piper" | .\.venv\Scripts\python.exe -m piper `
   -m ".\data\piper\es_MX-claude-high.onnx" `
-  --output_file ".\data\piper\test.wav"
+  -f ".\data\piper\test.wav"
 
 (New-Object System.Media.SoundPlayer ".\data\piper\test.wav").PlaySync()
 ```
@@ -311,33 +351,40 @@ node server.mjs
 2. Abre el dashboard y ve a **Opciones → TTS**:
 
 * **Motor:** `Piper`
-* **Modelo (.onnx):** ruta al `.onnx` (recomendado relativo)
-
-  * Ejemplo: `.\data\piper\es_MX-claude-high.onnx`
-* **Length scale:** controla la velocidad:
+* **Modelo (.onnx):** `.\data\piper\es_MX-claude-high.onnx`
+* **Length scale:** controla la velocidad (Piper):
 
   * `1.0` normal
   * `> 1.0` más lento
   * `< 1.0` más rápido
-* **Volumen:** `1.0` recomendado (ajusta si lo deseas)
-* **Python cmd:** comando para ejecutar Piper
+* **Volumen:** `1.0` recomendado
+* **Python cmd (IMPORTANTE):** `.\.venv\Scripts\python.exe`
 
-#### Python cmd (muy importante)
+3. Guarda opciones (persisten en `data/settings.json`).
 
-Para evitar problemas de entorno, se recomienda usar la ruta completa al Python del venv:
+4. Prueba con mensaje de prueba (UI o `/api/queue/test`).
 
-* Ejemplo:
+> Nota: el campo **Velocidad (0.5–2.0)** suele corresponder a `say`. En Piper, la velocidad práctica se ajusta con **Length scale**.
 
-  * `C:\...\TiktokTTS\.venv\Scripts\python.exe`
+### Errores comunes
 
-Alternativas (menos robustas):
+#### 1) Piper no habla y `modelPath` está vacío
 
-* `python` (solo si el venv está activo cuando se ejecuta el server)
-* `py -3.13` (si el launcher está disponible y funciona bien desde Node)
+✅ Solución: configura el modelo `.onnx` en Opciones → TTS y asegúrate de tener también el `.onnx.json`.
 
-3. Guarda opciones. Esto persistirá en `data/settings.json`.
+#### 2) El modelo no existe
 
-4. Prueba con un mensaje de prueba (UI o `/api/queue/test`).
+✅ Solución: descarga ambos archivos y verifica con `Test-Path`.
+
+#### 3) `pythonCmd` = `py` y “no encuentra Piper”
+
+✅ Solución: usa la ruta del Python del venv:
+
+* `.\.venv\Scripts\python.exe`
+
+#### 4) Piper falla y el sistema “vuelve” a say
+
+Esto es esperado: existe **fallback automático a `say`** para no romper la cola. Revisa logs para ver el motivo del fallo (cmd/modelo).
 
 ### Diagrama de selección de motor (Mermaid)
 
@@ -467,15 +514,17 @@ Archivo: `.vscode/launch.json`
 ### No hay audio / no habla
 
 * Verifica que **`ttsEnabled`** esté `true`
-* Si estás en **`say`**:
 
-  * Revisa voces instaladas (SAPI) y lista en `/api/tts/voices`
-  * Si `ttsVoice` está vacío, usa la voz por defecto del sistema
-* Si estás en **`piper`**:
+Si estás en **`say`**:
 
-  * Verifica `pythonCmd` (ideal: ruta completa al python del venv)
-  * Verifica `modelPath` y que exista también el `.onnx.json`
-  * Prueba Piper manualmente (sección “Probar Piper manualmente”)
+* Revisa voces instaladas (SAPI) y lista en `/api/tts/voices`
+* Si `ttsVoice` está vacío, usa la voz por defecto del sistema
+
+Si estás en **`piper`**:
+
+* Verifica `piper.modelPath` (y que exista el `.onnx.json`)
+* Verifica `piper.pythonCmd` (ideal: `.\.venv\Scripts\python.exe`, evitar `py`)
+* Ejecuta el [Smoke test](#smoke-test-prueba-rápida)
 
 ### El puerto está ocupado
 
