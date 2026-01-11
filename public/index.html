@@ -1,0 +1,83 @@
+﻿<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>TikTok TTS Dashboard</title>
+  <style>
+    body { font-family: system-ui, Segoe UI, Arial; margin: 16px; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; flex: 1; min-width: 320px; }
+    textarea { width: 100%; height: 220px; }
+    table { width: 100%; border-collapse: collapse; }
+    td, th { border-bottom: 1px solid #eee; padding: 6px; text-align: left; font-size: 14px; }
+    .muted { color: #777; }
+    .btn { padding: 6px 10px; border: 1px solid #ccc; background: #fafafa; border-radius: 8px; cursor: pointer; }
+    .btn.danger { border-color: #f1b3b3; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f3f3f3; font-size: 12px; }
+    #log { max-height: 320px; overflow: auto; font-family: ui-monospace, Consolas, monospace; font-size: 12px; background: #0b1020; color: #d7e1ff; padding: 8px; border-radius: 10px; }
+  </style>
+</head>
+<body>
+  <h2>TikTok TTS Dashboard <span id="status" class="pill">...</span> <span id="liveStatus" class="pill">TikTok: ...</span></h2>
+
+  <div class="row">
+    <div class="card">
+      <h3>Control</h3>
+      <button class="btn" id="ttsToggle">Toggle TTS</button>
+      <button class="btn danger" id="clearQueue">Vaciar cola</button>
+      <div style="margin-top:12px">
+        <strong>TikTok</strong>
+      </div>
+      <button class="btn" id="connectTikTok">Conectar TikTok</button>
+      <button class="btn danger" id="disconnectTikTok">Desconectar</button>
+      <div class="muted" id="tiktokInfo" style="margin-top:8px"></div>
+      <div class="muted" id="tiktokError"></div>
+      <div class="muted" style="margin-top:8px">
+        Consejo: si lees todo el chat, usa cooldowns altos.
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Cola (máx 20)</h3>
+      <table>
+        <thead><tr><th>#</th><th>Usuario</th><th>Texto</th><th>Acciones</th></tr></thead>
+        <tbody id="queueBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <h3>Baneados</h3>
+      <table>
+        <thead><tr><th>Usuario</th><th>Razón</th><th>Hasta</th><th></th></tr></thead>
+        <tbody id="bansBody"></tbody>
+      </table>
+
+      <h4>Ban manual</h4>
+      <input id="banUser" placeholder="uniqueId (sin @)" />
+      <input id="banMinutes" type="number" value="30" style="width:90px" />
+      <input id="banReason" placeholder="razón" />
+      <button class="btn danger" id="banBtn">Ban</button>
+    </div>
+
+    <div class="card">
+      <h3>Palabras baneadas</h3>
+      <div class="muted">Exactas (una por línea)</div>
+      <textarea id="exactTxt"></textarea>
+      <div class="muted">Substrings (pocas y largas)</div>
+      <textarea id="subTxt"></textarea>
+      <button class="btn" id="saveLists">Guardar listas</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Log (últimos eventos)</h3>
+    <div id="log"></div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
