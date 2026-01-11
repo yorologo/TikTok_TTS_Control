@@ -22,8 +22,24 @@ const banUser = document.getElementById("banUser");
 const banMinutes = document.getElementById("banMinutes");
 const banReason = document.getElementById("banReason");
 const banBtn = document.getElementById("banBtn");
+const optGlobalCooldown = document.getElementById("optGlobalCooldown");
+const optUserCooldown = document.getElementById("optUserCooldown");
+const optMaxQueue = document.getElementById("optMaxQueue");
+const optMaxChars = document.getElementById("optMaxChars");
+const optMaxWords = document.getElementById("optMaxWords");
+const optTtsRate = document.getElementById("optTtsRate");
+const optTtsVoice = document.getElementById("optTtsVoice");
+const refreshVoices = document.getElementById("refreshVoices");
+const voicesStatus = document.getElementById("voicesStatus");
+const optAutoBanEnabled = document.getElementById("optAutoBanEnabled");
+const optAutoBanStrikes = document.getElementById("optAutoBanStrikes");
+const optAutoBanMinutes = document.getElementById("optAutoBanMinutes");
+const saveSettings = document.getElementById("saveSettings");
+const reloadSettings = document.getElementById("reloadSettings");
+const settingsStatus = document.getElementById("settingsStatus");
 const testUser = document.getElementById("testUser");
 const testText = document.getElementById("testText");
+const testCount = document.getElementById("testCount");
 const testBtn = document.getElementById("testBtn");
 const testStatus = document.getElementById("testStatus");
 
@@ -39,6 +55,18 @@ const BTN_BAN = "inline-flex items-center rounded-lg border border-rose-200 bg-r
 const BTN_NEUTRAL = "inline-flex items-center rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-700 shadow-sm transition hover:-translate-y-0.5 hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800";
 const TEST_STATUS_BASE = "mt-2 text-xs";
 const TEST_STATUS_STYLES = {
+  ok: "text-emerald-600 dark:text-emerald-400",
+  error: "text-rose-600 dark:text-rose-400",
+  info: "text-slate-500 dark:text-slate-400"
+};
+const SETTINGS_STATUS_BASE = "text-xs";
+const SETTINGS_STATUS_STYLES = {
+  ok: "text-emerald-600 dark:text-emerald-400",
+  error: "text-rose-600 dark:text-rose-400",
+  info: "text-slate-500 dark:text-slate-400"
+};
+const VOICE_STATUS_BASE = "text-xs";
+const VOICE_STATUS_STYLES = {
   ok: "text-emerald-600 dark:text-emerald-400",
   error: "text-rose-600 dark:text-rose-400",
   info: "text-slate-500 dark:text-slate-400"
@@ -89,6 +117,36 @@ function setTestStatus(message, variant) {
   testStatus.textContent = message;
 }
 
+function setSettingsStatus(message, variant) {
+  if (!settingsStatus) return;
+  const style = SETTINGS_STATUS_STYLES[variant] || SETTINGS_STATUS_STYLES.info;
+  settingsStatus.className = `${SETTINGS_STATUS_BASE} ${style}`;
+  settingsStatus.textContent = message;
+}
+
+function setVoicesStatus(message, variant) {
+  if (!voicesStatus) return;
+  const style = VOICE_STATUS_STYLES[variant] || VOICE_STATUS_STYLES.info;
+  voicesStatus.className = `${VOICE_STATUS_BASE} ${style}`;
+  voicesStatus.textContent = message;
+}
+
+let pendingVoice = "";
+function applySettingsToForm(s) {
+  if (!s) return;
+  if (optGlobalCooldown) optGlobalCooldown.value = s.globalCooldownMs ?? "";
+  if (optUserCooldown) optUserCooldown.value = s.perUserCooldownMs ?? "";
+  if (optMaxQueue) optMaxQueue.value = s.maxQueue ?? "";
+  if (optMaxChars) optMaxChars.value = s.maxChars ?? "";
+  if (optMaxWords) optMaxWords.value = s.maxWords ?? "";
+  if (optTtsRate) optTtsRate.value = s.ttsRate ?? "";
+  if (optAutoBanEnabled) optAutoBanEnabled.checked = !!s.autoBanEnabled;
+  if (optAutoBanStrikes) optAutoBanStrikes.value = s.autoBanStrikeThreshold ?? "";
+  if (optAutoBanMinutes) optAutoBanMinutes.value = s.autoBanBanMinutes ?? "";
+  pendingVoice = s.ttsVoice ?? "";
+  if (optTtsVoice) optTtsVoice.value = pendingVoice;
+}
+
 function addLogLine(obj) {
   const line = JSON.stringify(obj);
   const div = document.createElement("div");
@@ -132,6 +190,27 @@ function renderTikTokStatus(s) {
   setLivePill(variant, `TikTok: ${liveLabel}`);
   tiktokInfo.textContent = `Estado: ${statusLabel}${s.roomId ? ` | roomId: ${s.roomId}` : ""}`;
   tiktokError.textContent = s.lastError ? `Error: ${s.lastError}` : "";
+}
+
+function populateVoices(voices) {
+  if (!optTtsVoice) return;
+  const current = pendingVoice || optTtsVoice.value || "";
+  const unique = Array.isArray(voices) ? Array.from(new Set(voices)) : [];
+  unique.sort((a, b) => a.localeCompare(b));
+  optTtsVoice.innerHTML = "<option value=\"\">Predeterminada</option>";
+  if (current && !unique.includes(current)) {
+    const option = document.createElement("option");
+    option.value = current;
+    option.textContent = `${current} (custom)`;
+    optTtsVoice.appendChild(option);
+  }
+  for (const voice of unique) {
+    const option = document.createElement("option");
+    option.value = voice;
+    option.textContent = voice;
+    optTtsVoice.appendChild(option);
+  }
+  optTtsVoice.value = current;
 }
 
 socket.on("queue", (q) => {
@@ -217,6 +296,10 @@ socket.on("listsUpdated", () => {
   // opcional: refrescar UI
 });
 
+socket.on("settings", (s) => {
+  applySettingsToForm(s);
+});
+
 socket.on("tiktokStatus", (s) => {
   renderTikTokStatus(s);
 });
@@ -281,6 +364,8 @@ if (testBtn) {
   testBtn.addEventListener("click", async () => {
     const uid = (testUser?.value || "").trim().replace(/^@/, "");
     const text = (testText?.value || "").trim();
+    const repeat = Number(testCount?.value || 1);
+    const count = Number.isFinite(repeat) ? Math.max(1, Math.min(50, Math.trunc(repeat))) : 1;
     if (!text) {
       setTestStatus("Ingresa un texto de prueba.", "error");
       return;
@@ -293,12 +378,14 @@ if (testBtn) {
         body: JSON.stringify({
           uniqueId: uid || "local",
           nickname: uid || "local",
-          text
+          text,
+          count
         })
       });
       const j = await r.json();
       if (j.ok) {
-        setTestStatus("Mensaje agregado a la cola.", "ok");
+        const dropped = j.dropped ? `, drop: ${j.dropped}` : "";
+        setTestStatus(`Agregado: ${j.added ?? 1}${dropped}`, "ok");
         if (testText) testText.value = "";
       } else {
         setTestStatus(`Bloqueado: ${j.reason || "error"}`, "error");
@@ -317,6 +404,32 @@ async function loadLists() {
   subTxt.value = (j.sub || []).join("\n");
 }
 
+async function loadSettings() {
+  const r = await fetch("/api/settings");
+  const j = await r.json();
+  applySettingsToForm(j);
+}
+
+async function loadVoices() {
+  if (!optTtsVoice) return;
+  setVoicesStatus("Cargando voces...", "info");
+  try {
+    const r = await fetch("/api/tts/voices");
+    const j = await r.json();
+    populateVoices(j.voices || []);
+    const count = Array.isArray(j.voices) ? j.voices.length : 0;
+    if (count === 0) {
+      setVoicesStatus("Error cargando voces.", "error");
+    } else if (j.error) {
+      setVoicesStatus(`Voces: ${count} (fallback)`, "ok");
+    } else {
+      setVoicesStatus(`Voces: ${count}`, "ok");
+    }
+  } catch (err) {
+    setVoicesStatus("Error cargando voces.", "error");
+  }
+}
+
 async function loadTikTokStatus() {
   const r = await fetch("/api/tiktok/status");
   const j = await r.json();
@@ -333,5 +446,73 @@ if (saveLists) {
   });
 }
 
+if (saveSettings) {
+  saveSettings.addEventListener("click", async () => {
+    const fields = [
+      { el: optGlobalCooldown, key: "globalCooldownMs", min: 0 },
+      { el: optUserCooldown, key: "perUserCooldownMs", min: 0 },
+      { el: optMaxQueue, key: "maxQueue", min: 1 },
+      { el: optMaxChars, key: "maxChars", min: 1 },
+      { el: optMaxWords, key: "maxWords", min: 1 },
+      { el: optAutoBanStrikes, key: "autoBanStrikeThreshold", min: 1 },
+      { el: optAutoBanMinutes, key: "autoBanBanMinutes", min: 1 }
+    ];
+    const payload = {};
+    for (const field of fields) {
+      if (!field.el) continue;
+      const value = Number(field.el.value);
+      if (!Number.isFinite(value)) {
+        setSettingsStatus(`Valor invalido: ${field.key}`, "error");
+        return;
+      }
+      payload[field.key] = Math.max(field.min, Math.trunc(value));
+    }
+    if (optAutoBanEnabled) payload.autoBanEnabled = !!optAutoBanEnabled.checked;
+    if (optTtsRate) {
+      const rate = Number(optTtsRate.value);
+      if (!Number.isFinite(rate)) {
+        setSettingsStatus("Valor invalido: ttsRate", "error");
+        return;
+      }
+      payload.ttsRate = Math.min(2, Math.max(0.5, rate));
+    }
+    if (optTtsVoice) payload.ttsVoice = optTtsVoice.value || "";
+
+    setSettingsStatus("Guardando...", "info");
+    try {
+      const r = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const j = await r.json();
+      if (j.ok) {
+        applySettingsToForm(j.settings);
+        setSettingsStatus("Opciones guardadas.", "ok");
+      } else {
+        setSettingsStatus("No se pudo guardar.", "error");
+      }
+    } catch (err) {
+      setSettingsStatus("Error guardando opciones.", "error");
+    }
+  });
+}
+
+if (reloadSettings) {
+  reloadSettings.addEventListener("click", async () => {
+    setSettingsStatus("Recargando...", "info");
+    await loadSettings();
+    setSettingsStatus("Opciones recargadas.", "ok");
+  });
+}
+
+if (refreshVoices) {
+  refreshVoices.addEventListener("click", async () => {
+    await loadVoices();
+  });
+}
+
 loadLists();
+loadSettings();
+loadVoices();
 loadTikTokStatus();

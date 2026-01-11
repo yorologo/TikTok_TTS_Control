@@ -1,6 +1,7 @@
 ﻿import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { execFile } from "child_process";
 import express from "express";
 import { createServer } from "http";
 import { Server as SocketIOServer } from "socket.io";
@@ -32,17 +33,87 @@ function readLines(filePath) {
   } catch { return []; }
 }
 
+function getInstalledVoicesWin() {
+  return new Promise((resolve) => {
+    const command = "Add-Type -AssemblyName System.Speech; $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer; $synth.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo.Name }";
+    execFile("powershell", ["-NoProfile", "-Command", command], { windowsHide: true }, (err, stdout) => {
+      if (err) {
+        resolve({ voices: [], error: String(err) });
+        return;
+      }
+      const voices = String(stdout || "")
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(Boolean);
+      resolve({ voices });
+    });
+  });
+}
+
+async function getInstalledVoices() {
+  const sayResult = await new Promise((resolve) => {
+    say.getInstalledVoices((err, voices) => {
+      if (err) {
+        resolve({ voices: [], error: String(err) });
+        return;
+      }
+      resolve({ voices: Array.isArray(voices) ? voices : [] });
+    });
+  });
+
+  if (sayResult.voices.length > 0) {
+    return sayResult;
+  }
+
+  if (process.platform === "win32") {
+    const winResult = await getInstalledVoicesWin();
+    if (winResult.voices.length > 0) {
+      return winResult;
+    }
+    return { voices: [], error: sayResult.error || winResult.error || "no_voices" };
+  }
+
+  return sayResult;
+}
+
 const DATA_DIR = path.join(__dirname, "data");
 const SETTINGS_PATH = path.join(DATA_DIR, "settings.json");
 const BANNED_PATH = path.join(DATA_DIR, "banned_users.json");
 const BAD_EXACT_PATH = path.join(DATA_DIR, "badwords_exact_es.txt");
 const BAD_SUB_PATH = path.join(DATA_DIR, "badwords_substring_es.txt");
 
+const DEFAULT_SETTINGS = {
+  tiktokUsername: "TU_USUARIO_SIN_ARROBA",
+  bindHost: "127.0.0.1",
+  port: 8787,
+  ttsEnabled: true,
+  globalCooldownMs: 9000,
+  perUserCooldownMs: 30000,
+  maxQueue: 6,
+  maxChars: 80,
+  maxWords: 14,
+  ttsVoice: "",
+  ttsRate: 1.0,
+  autoBan: {
+    enabled: true,
+    strikeThreshold: 2,
+    banMinutes: 30
+  }
+};
+
 let settings = readJson(SETTINGS_PATH, null);
 if (!settings) {
-  console.error("Falta data/settings.json");
-  process.exit(1);
+  settings = { ...DEFAULT_SETTINGS };
+  writeJson(SETTINGS_PATH, settings);
 }
+settings = {
+  ...DEFAULT_SETTINGS,
+  ...settings,
+  autoBan: {
+    ...DEFAULT_SETTINGS.autoBan,
+    ...(settings.autoBan || {})
+  }
+};
 
 let bannedDb = readJson(BANNED_PATH, { users: {} });
 let bannedExact = new Set(readLines(BAD_EXACT_PATH).map(s => s.toLowerCase()));
@@ -201,7 +272,9 @@ function speakNext() {
 
   pushLog({ type: "tts_speak", msg: m });
 
-  say.speak(m.text, null, 1.0, () => {
+  const voice = settings.ttsVoice || null;
+  const rate = Number.isFinite(Number(settings.ttsRate)) ? Number(settings.ttsRate) : 1.0;
+  say.speak(m.text, voice, rate, () => {
     setTimeout(() => speakNext(), 120);
   });
 }
@@ -276,6 +349,88 @@ function getListsSnapshot() {
 function getStatusSnapshot() {
   return { ttsEnabled, speaking, queueSize: queue.length };
 }
+function getSettingsSnapshot() {
+  return {
+    globalCooldownMs: settings.globalCooldownMs,
+    perUserCooldownMs: settings.perUserCooldownMs,
+    maxQueue: settings.maxQueue,
+    maxChars: settings.maxChars,
+    maxWords: settings.maxWords,
+    ttsRate: settings.ttsRate,
+    ttsVoice: settings.ttsVoice,
+    autoBanEnabled: settings.autoBan?.enabled ?? true,
+    autoBanStrikeThreshold: settings.autoBan?.strikeThreshold ?? 2,
+    autoBanBanMinutes: settings.autoBan?.banMinutes ?? 30
+  };
+}
+function toInt(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.trunc(n) : fallback;
+}
+function applySettingsUpdate(update) {
+  if (!update || typeof update !== "object") return { ok: false, error: "invalid" };
+
+  const next = {
+    ...settings,
+    autoBan: {
+      ...settings.autoBan
+    }
+  };
+  if ("globalCooldownMs" in update) {
+    const n = toInt(update.globalCooldownMs, settings.globalCooldownMs);
+    next.globalCooldownMs = Math.max(0, n);
+  }
+  if ("perUserCooldownMs" in update) {
+    const n = toInt(update.perUserCooldownMs, settings.perUserCooldownMs);
+    next.perUserCooldownMs = Math.max(0, n);
+  }
+  if ("maxQueue" in update) {
+    const n = toInt(update.maxQueue, settings.maxQueue);
+    next.maxQueue = Math.max(1, n);
+  }
+  if ("maxChars" in update) {
+    const n = toInt(update.maxChars, settings.maxChars);
+    next.maxChars = Math.max(1, n);
+  }
+  if ("maxWords" in update) {
+    const n = toInt(update.maxWords, settings.maxWords);
+    next.maxWords = Math.max(1, n);
+  }
+  if ("ttsRate" in update) {
+    const n = Number(update.ttsRate);
+    if (Number.isFinite(n)) {
+      next.ttsRate = Math.min(2, Math.max(0.5, n));
+    }
+  }
+  if ("ttsVoice" in update) {
+    const v = String(update.ttsVoice ?? "").trim();
+    next.ttsVoice = v;
+  }
+  if ("autoBanEnabled" in update) {
+    next.autoBan.enabled = !!update.autoBanEnabled;
+  }
+  if ("autoBanStrikeThreshold" in update) {
+    const n = toInt(update.autoBanStrikeThreshold, settings.autoBan?.strikeThreshold ?? 2);
+    next.autoBan.strikeThreshold = Math.max(1, n);
+  }
+  if ("autoBanBanMinutes" in update) {
+    const n = toInt(update.autoBanBanMinutes, settings.autoBan?.banMinutes ?? 30);
+    next.autoBan.banMinutes = Math.max(1, n);
+  }
+
+  settings = next;
+  writeJson(SETTINGS_PATH, settings);
+
+  while (queue.length > settings.maxQueue) {
+    const removed = queue.pop();
+    pushLog({ type: "queue_drop", reason: "queue_resize", msg: removed });
+  }
+
+  io.emit("settings", getSettingsSnapshot());
+  io.emit("queue", getQueueSnapshot());
+  io.emit("status", getStatusSnapshot());
+  return { ok: true };
+}
 function getTikTokStatusSnapshot() {
   return {
     status: tiktokStatus.status,
@@ -309,6 +464,10 @@ app.post("/api/tts", (req, res) => {
   if (ttsEnabled && !speaking) speakNext();
   res.json({ ok: true, ttsEnabled });
 });
+app.get("/api/tts/voices", async (_, res) => {
+  const result = await getInstalledVoices();
+  res.json(result);
+});
 app.post("/api/queue/clear", (_, res) => {
   queue.length = 0;
   io.emit("queue", getQueueSnapshot());
@@ -322,7 +481,7 @@ app.post("/api/queue/skip", (req, res) => {
   res.json({ ok: true });
 });
 app.post("/api/queue/test", (req, res) => {
-  const { uniqueId, nickname, text } = req.body ?? {};
+  const { uniqueId, nickname, text, count } = req.body ?? {};
   const rawText = typeof text === "string" ? text : "";
   const uid = typeof uniqueId === "string" && uniqueId.trim()
     ? uniqueId.trim().replace(/^@/, "")
@@ -330,6 +489,9 @@ app.post("/api/queue/test", (req, res) => {
   const name = typeof nickname === "string" && nickname.trim()
     ? nickname.trim()
     : uid;
+  const repeat = Number.isFinite(Number(count))
+    ? Math.max(1, Math.min(50, Math.trunc(Number(count))))
+    : 1;
 
   const b = isBanned(uid);
   if (b.banned) {
@@ -343,21 +505,38 @@ app.post("/api/queue/test", (req, res) => {
     return res.json({ ok: false, reason: f.reason });
   }
 
-  if (queue.length >= settings.maxQueue) {
-    pushLog({ type: "queue_drop", reason: "queue_full", msg: { uniqueId: uid, nickname: name, text: f.text } });
-    return res.json({ ok: false, reason: "queue_full" });
+  let added = 0;
+  let dropped = 0;
+  for (let i = 0; i < repeat; i++) {
+    const msg = {
+      id: nextMsgId++,
+      uniqueId: uid,
+      nickname: name,
+      text: f.text,
+      ts: nowMs(),
+      source: "local"
+    };
+    const ok = enqueueMessage(msg);
+    if (ok) {
+      added += 1;
+    } else {
+      dropped += 1;
+      break;
+    }
   }
 
-  const msg = {
-    id: nextMsgId++,
-    uniqueId: uid,
-    nickname: name,
-    text: f.text,
-    ts: nowMs(),
-    source: "local"
-  };
-  enqueueMessage(msg);
-  res.json({ ok: true, msg });
+  if (added === 0) {
+    return res.json({ ok: false, reason: "queue_full" });
+  }
+  res.json({ ok: true, added, dropped });
+});
+
+// API: settings
+app.get("/api/settings", (_, res) => res.json(getSettingsSnapshot()));
+app.post("/api/settings", (req, res) => {
+  const result = applySettingsUpdate(req.body);
+  if (!result.ok) return res.status(400).json(result);
+  res.json({ ok: true, settings: getSettingsSnapshot() });
 });
 
 // API: TikTok connection
@@ -391,6 +570,7 @@ io.on("connection", (socket) => {
   socket.emit("queue", getQueueSnapshot());
   socket.emit("bansUpdated", getBansSnapshot());
   socket.emit("listsUpdated", getListsSnapshot());
+  socket.emit("settings", getSettingsSnapshot());
   socket.emit("tiktokStatus", getTikTokStatusSnapshot());
   socket.emit("logBulk", recentLog);
 });
