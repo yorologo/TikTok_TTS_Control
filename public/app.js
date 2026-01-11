@@ -22,6 +22,10 @@ const banUser = document.getElementById("banUser");
 const banMinutes = document.getElementById("banMinutes");
 const banReason = document.getElementById("banReason");
 const banBtn = document.getElementById("banBtn");
+const testUser = document.getElementById("testUser");
+const testText = document.getElementById("testText");
+const testBtn = document.getElementById("testBtn");
+const testStatus = document.getElementById("testStatus");
 
 const THEME_KEY = "theme";
 const LIVE_PILL_BASE = "inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold shadow-sm transition";
@@ -33,6 +37,12 @@ const LIVE_STYLES = {
 };
 const BTN_BAN = "inline-flex items-center rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1 text-xs font-semibold text-rose-700 shadow-sm transition hover:-translate-y-0.5 hover:bg-rose-100 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-200 dark:hover:bg-rose-900/40";
 const BTN_NEUTRAL = "inline-flex items-center rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-700 shadow-sm transition hover:-translate-y-0.5 hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800";
+const TEST_STATUS_BASE = "mt-2 text-xs";
+const TEST_STATUS_STYLES = {
+  ok: "text-emerald-600 dark:text-emerald-400",
+  error: "text-rose-600 dark:text-rose-400",
+  info: "text-slate-500 dark:text-slate-400"
+};
 
 let ttsEnabled = true;
 
@@ -70,6 +80,13 @@ function setLivePill(variant, label) {
   const style = LIVE_STYLES[variant] || LIVE_STYLES.offline;
   liveStatus.className = `${LIVE_PILL_BASE} ${style}`;
   liveStatus.textContent = label;
+}
+
+function setTestStatus(message, variant) {
+  if (!testStatus) return;
+  const style = TEST_STATUS_STYLES[variant] || TEST_STATUS_STYLES.info;
+  testStatus.className = `${TEST_STATUS_BASE} ${style}`;
+  testStatus.textContent = message;
 }
 
 function addLogLine(obj) {
@@ -124,9 +141,12 @@ socket.on("queue", (q) => {
     tr.innerHTML = `
       <td class="py-2 pr-2 align-top">${m.id}</td>
       <td class="py-2 pr-2 align-top">@${m.uniqueId}</td>
-      <td class="py-2 pr-2 align-top">${m.text}</td>
+      <td class="py-2 pr-2 align-top cursor-pointer hover:text-rose-600 dark:hover:text-rose-300" data-skip="${m.id}" title="Omitir">${m.text}</td>
       <td class="py-2 align-top">
-        <button class="${BTN_BAN}" data-ban="${m.uniqueId}">Ban</button>
+        <div class="flex flex-wrap gap-2">
+          <button class="${BTN_BAN}" data-ban="${m.uniqueId}">Ban</button>
+          <button class="${BTN_NEUTRAL}" data-skip="${m.id}">Omitir</button>
+        </div>
       </td>
     `;
     queueBody.appendChild(tr);
@@ -139,6 +159,28 @@ socket.on("queue", (q) => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ uniqueId: uid, minutes: 60, reason: "manual (desde cola)" })
+      });
+    });
+  });
+
+  queueBody.querySelectorAll("button[data-skip]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const id = Number(btn.getAttribute("data-skip"));
+      await fetch("/api/queue/skip", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id })
+      });
+    });
+  });
+
+  queueBody.querySelectorAll("td[data-skip]").forEach(cell => {
+    cell.addEventListener("click", async () => {
+      const id = Number(cell.getAttribute("data-skip"));
+      await fetch("/api/queue/skip", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id })
       });
     });
   });
@@ -232,6 +274,38 @@ if (banBtn) {
         reason: banReason.value || "manual"
       })
     });
+  });
+}
+
+if (testBtn) {
+  testBtn.addEventListener("click", async () => {
+    const uid = (testUser?.value || "").trim().replace(/^@/, "");
+    const text = (testText?.value || "").trim();
+    if (!text) {
+      setTestStatus("Ingresa un texto de prueba.", "error");
+      return;
+    }
+    setTestStatus("Enviando...", "info");
+    try {
+      const r = await fetch("/api/queue/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          uniqueId: uid || "local",
+          nickname: uid || "local",
+          text
+        })
+      });
+      const j = await r.json();
+      if (j.ok) {
+        setTestStatus("Mensaje agregado a la cola.", "ok");
+        if (testText) testText.value = "";
+      } else {
+        setTestStatus(`Bloqueado: ${j.reason || "error"}`, "error");
+      }
+    } catch (err) {
+      setTestStatus("Error enviando el mensaje.", "error");
+    }
   });
 }
 

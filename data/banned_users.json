@@ -1,9 +1,3 @@
 {
-  "users": {
-    "foo": {
-      "reason": "manual",
-      "addedAtMs": 1768150270766,
-      "untilMs": 1768152070766
-    }
-  }
+  "users": {}
 }

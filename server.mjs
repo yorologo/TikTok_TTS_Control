@@ -174,11 +174,21 @@ function canSpeak(uniqueId) {
 function enqueueMessage(msg) {
   if (queue.length >= settings.maxQueue) {
     pushLog({ type: "queue_drop", reason: "queue_full", msg });
-    return;
+    return false;
   }
   queue.push(msg);
   io.emit("queue", getQueueSnapshot());
   if (!speaking) speakNext();
+  return true;
+}
+
+function skipQueueMessage(id) {
+  const idx = queue.findIndex(m => m.id === id);
+  if (idx === -1) return false;
+  const [removed] = queue.splice(idx, 1);
+  io.emit("queue", getQueueSnapshot());
+  pushLog({ type: "queue_skip", msg: removed });
+  return true;
 }
 
 function speakNext() {
@@ -303,6 +313,51 @@ app.post("/api/queue/clear", (_, res) => {
   queue.length = 0;
   io.emit("queue", getQueueSnapshot());
   res.json({ ok: true });
+});
+app.post("/api/queue/skip", (req, res) => {
+  const id = Number(req.body?.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "id requerido" });
+  const ok = skipQueueMessage(id);
+  if (!ok) return res.status(404).json({ error: "not_found" });
+  res.json({ ok: true });
+});
+app.post("/api/queue/test", (req, res) => {
+  const { uniqueId, nickname, text } = req.body ?? {};
+  const rawText = typeof text === "string" ? text : "";
+  const uid = typeof uniqueId === "string" && uniqueId.trim()
+    ? uniqueId.trim().replace(/^@/, "")
+    : "local";
+  const name = typeof nickname === "string" && nickname.trim()
+    ? nickname.trim()
+    : uid;
+
+  const b = isBanned(uid);
+  if (b.banned) {
+    pushLog({ type: "blocked_banned_user", source: "local", uniqueId: uid, nickname: name, comment: rawText, reason: b.entry?.reason });
+    return res.json({ ok: false, reason: "banned" });
+  }
+
+  const f = filterChatText(rawText);
+  if (!f.ok) {
+    pushLog({ type: "blocked_filter", source: "local", uniqueId: uid, nickname: name, comment: rawText, reason: f.reason, strikes: 0 });
+    return res.json({ ok: false, reason: f.reason });
+  }
+
+  if (queue.length >= settings.maxQueue) {
+    pushLog({ type: "queue_drop", reason: "queue_full", msg: { uniqueId: uid, nickname: name, text: f.text } });
+    return res.json({ ok: false, reason: "queue_full" });
+  }
+
+  const msg = {
+    id: nextMsgId++,
+    uniqueId: uid,
+    nickname: name,
+    text: f.text,
+    ts: nowMs(),
+    source: "local"
+  };
+  enqueueMessage(msg);
+  res.json({ ok: true, msg });
 });
 
 // API: TikTok connection
