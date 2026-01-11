@@ -1,7 +1,8 @@
 ﻿import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { execFile } from "child_process";
+import os from "os";
+import { execFile, spawn } from "child_process";
 import express from "express";
 import { createServer } from "http";
 import { Server as SocketIOServer } from "socket.io";
@@ -76,6 +77,71 @@ async function getInstalledVoices() {
   return sayResult;
 }
 
+function runProcess(cmd, args, inputText) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(cmd, args, { windowsHide: true });
+    let stderr = "";
+
+    if (inputText !== null && inputText !== undefined) {
+      proc.stdin.write(inputText);
+      proc.stdin.end();
+    }
+
+    proc.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    proc.on("error", reject);
+    proc.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`${cmd} exited ${code}: ${stderr}`));
+    });
+  });
+}
+
+async function speakWithPiper(text, options) {
+  const modelPath = options?.modelPath || "";
+  if (!modelPath) {
+    throw new Error("piper_model_missing");
+  }
+
+  const lengthScaleRaw = Number(options?.lengthScale ?? 1.0);
+  const lengthScale = Number.isFinite(lengthScaleRaw) ? lengthScaleRaw : 1.0;
+  const volumeRaw = Number(options?.volume ?? 1.0);
+  const volume = Number.isFinite(volumeRaw) ? volumeRaw : 1.0;
+  const pythonCmd = options?.pythonCmd || "py";
+
+  const wavPath = path.join(os.tmpdir(), `piper-${Date.now()}-${Math.random().toString(16).slice(2)}.wav`);
+
+  await runProcess(
+    pythonCmd,
+    [
+      "-m",
+      "piper",
+      "-m",
+      modelPath,
+      "--output_file",
+      wavPath,
+      "--length_scale",
+      String(lengthScale),
+      "--volume",
+      String(volume)
+    ],
+    `${text}\n`
+  );
+
+  try {
+    const safePath = wavPath.replace(/'/g, "''");
+    const psCmd = `(New-Object System.Media.SoundPlayer '${safePath}').PlaySync()`;
+    await runProcess("powershell", ["-NoProfile", "-Command", psCmd]);
+  } finally {
+    await fs.promises.unlink(wavPath).catch(() => {});
+  }
+}
+
 const DATA_DIR = path.join(__dirname, "data");
 const SETTINGS_PATH = path.join(DATA_DIR, "settings.json");
 const BANNED_PATH = path.join(DATA_DIR, "banned_users.json");
@@ -92,8 +158,15 @@ const DEFAULT_SETTINGS = {
   maxQueue: 6,
   maxChars: 80,
   maxWords: 14,
+  ttsEngine: "say",
   ttsVoice: "",
   ttsRate: 1.0,
+  piper: {
+    modelPath: "",
+    lengthScale: 1.0,
+    volume: 1.0,
+    pythonCmd: "py"
+  },
   autoBan: {
     enabled: true,
     strikeThreshold: 2,
@@ -112,6 +185,10 @@ settings = {
   autoBan: {
     ...DEFAULT_SETTINGS.autoBan,
     ...(settings.autoBan || {})
+  },
+  piper: {
+    ...DEFAULT_SETTINGS.piper,
+    ...(settings.piper || {})
   }
 };
 
@@ -262,7 +339,32 @@ function skipQueueMessage(id) {
   return true;
 }
 
-function speakNext() {
+function speakWithSay(text) {
+  return new Promise((resolve, reject) => {
+    const voice = settings.ttsVoice || null;
+    const rate = Number.isFinite(Number(settings.ttsRate)) ? Number(settings.ttsRate) : 1.0;
+    try {
+      say.speak(text, voice, rate, () => resolve());
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+async function speakMessage(text) {
+  if (settings.ttsEngine === "piper") {
+    try {
+      await speakWithPiper(text, settings.piper);
+      return;
+    } catch (err) {
+      pushLog({ type: "tts_error", error: String(err), engine: "piper" });
+    }
+  }
+
+  await speakWithSay(text);
+}
+
+async function speakNext() {
   if (!ttsEnabled) { speaking = false; return; }
   if (queue.length === 0) { speaking = false; return; }
 
@@ -272,11 +374,13 @@ function speakNext() {
 
   pushLog({ type: "tts_speak", msg: m });
 
-  const voice = settings.ttsVoice || null;
-  const rate = Number.isFinite(Number(settings.ttsRate)) ? Number(settings.ttsRate) : 1.0;
-  say.speak(m.text, voice, rate, () => {
+  try {
+    await speakMessage(m.text);
+  } catch (err) {
+    pushLog({ type: "tts_error", error: String(err), msg: m });
+  } finally {
     setTimeout(() => speakNext(), 120);
-  });
+  }
 }
 
 // ---------- Moderación por palabras ----------
@@ -356,8 +460,13 @@ function getSettingsSnapshot() {
     maxQueue: settings.maxQueue,
     maxChars: settings.maxChars,
     maxWords: settings.maxWords,
+    ttsEngine: settings.ttsEngine,
     ttsRate: settings.ttsRate,
     ttsVoice: settings.ttsVoice,
+    piperModelPath: settings.piper?.modelPath ?? "",
+    piperLengthScale: settings.piper?.lengthScale ?? 1.0,
+    piperVolume: settings.piper?.volume ?? 1.0,
+    piperPythonCmd: settings.piper?.pythonCmd ?? "py",
     autoBanEnabled: settings.autoBan?.enabled ?? true,
     autoBanStrikeThreshold: settings.autoBan?.strikeThreshold ?? 2,
     autoBanBanMinutes: settings.autoBan?.banMinutes ?? 30
@@ -374,6 +483,9 @@ function applySettingsUpdate(update) {
     ...settings,
     autoBan: {
       ...settings.autoBan
+    },
+    piper: {
+      ...settings.piper
     }
   };
   if ("globalCooldownMs" in update) {
@@ -395,6 +507,32 @@ function applySettingsUpdate(update) {
   if ("maxWords" in update) {
     const n = toInt(update.maxWords, settings.maxWords);
     next.maxWords = Math.max(1, n);
+  }
+  if ("ttsEngine" in update) {
+    const v = String(update.ttsEngine ?? "").trim();
+    if (v === "say" || v === "piper") {
+      next.ttsEngine = v;
+    }
+  }
+  if ("piperModelPath" in update) {
+    const v = String(update.piperModelPath ?? "").trim();
+    next.piper.modelPath = v;
+  }
+  if ("piperLengthScale" in update) {
+    const n = Number(update.piperLengthScale);
+    if (Number.isFinite(n)) {
+      next.piper.lengthScale = Math.min(2, Math.max(0.5, n));
+    }
+  }
+  if ("piperVolume" in update) {
+    const n = Number(update.piperVolume);
+    if (Number.isFinite(n)) {
+      next.piper.volume = Math.min(2, Math.max(0, n));
+    }
+  }
+  if ("piperPythonCmd" in update) {
+    const v = String(update.piperPythonCmd ?? "").trim();
+    next.piper.pythonCmd = v || "py";
   }
   if ("ttsRate" in update) {
     const n = Number(update.ttsRate);

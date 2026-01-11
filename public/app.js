@@ -32,8 +32,15 @@ const optUserCooldown = document.getElementById("optUserCooldown");
 const optMaxQueue = document.getElementById("optMaxQueue");
 const optMaxChars = document.getElementById("optMaxChars");
 const optMaxWords = document.getElementById("optMaxWords");
+const optTtsEngine = document.getElementById("optTtsEngine");
 const optTtsRate = document.getElementById("optTtsRate");
 const optTtsVoice = document.getElementById("optTtsVoice");
+const saySettings = document.getElementById("saySettings");
+const piperSettings = document.getElementById("piperSettings");
+const optPiperModelPath = document.getElementById("optPiperModelPath");
+const optPiperLengthScale = document.getElementById("optPiperLengthScale");
+const optPiperVolume = document.getElementById("optPiperVolume");
+const optPiperPythonCmd = document.getElementById("optPiperPythonCmd");
 const refreshVoices = document.getElementById("refreshVoices");
 const voicesStatus = document.getElementById("voicesStatus");
 const optAutoBanEnabled = document.getElementById("optAutoBanEnabled");
@@ -149,6 +156,12 @@ function setSettingsStatus(message, variant) {
   settingsStatus.textContent = message;
 }
 
+function setTtsEngineState(engine) {
+  const usePiper = engine === "piper";
+  if (piperSettings) piperSettings.classList.toggle("hidden", !usePiper);
+  if (saySettings) saySettings.classList.toggle("hidden", usePiper);
+}
+
 function setVoicesStatus(message, variant) {
   if (!voicesStatus) return;
   const style = VOICE_STATUS_STYLES[variant] || VOICE_STATUS_STYLES.info;
@@ -164,10 +177,16 @@ function applySettingsToForm(s) {
   if (optMaxQueue) optMaxQueue.value = s.maxQueue ?? "";
   if (optMaxChars) optMaxChars.value = s.maxChars ?? "";
   if (optMaxWords) optMaxWords.value = s.maxWords ?? "";
+  if (optTtsEngine) optTtsEngine.value = s.ttsEngine || "say";
   if (optTtsRate) optTtsRate.value = s.ttsRate ?? "";
+  if (optPiperModelPath) optPiperModelPath.value = s.piperModelPath ?? "";
+  if (optPiperLengthScale) optPiperLengthScale.value = s.piperLengthScale ?? "";
+  if (optPiperVolume) optPiperVolume.value = s.piperVolume ?? "";
+  if (optPiperPythonCmd) optPiperPythonCmd.value = s.piperPythonCmd ?? "py";
   if (optAutoBanEnabled) optAutoBanEnabled.checked = !!s.autoBanEnabled;
   if (optAutoBanStrikes) optAutoBanStrikes.value = s.autoBanStrikeThreshold ?? "";
   if (optAutoBanMinutes) optAutoBanMinutes.value = s.autoBanBanMinutes ?? "";
+  setTtsEngineState(optTtsEngine ? optTtsEngine.value : s.ttsEngine);
   pendingVoice = s.ttsVoice ?? "";
   if (optTtsVoice) optTtsVoice.value = pendingVoice;
 }
@@ -205,6 +224,11 @@ if (optionsOverlay) {
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape") setOptionsOpen(false);
 });
+if (optTtsEngine) {
+  optTtsEngine.addEventListener("change", () => {
+    setTtsEngineState(optTtsEngine.value);
+  });
+}
 
 socket.on("status", (s) => {
   ttsEnabled = !!s.ttsEnabled;
@@ -510,6 +534,14 @@ if (saveSettings) {
       payload[field.key] = Math.max(field.min, Math.trunc(value));
     }
     if (optAutoBanEnabled) payload.autoBanEnabled = !!optAutoBanEnabled.checked;
+    if (optTtsEngine) {
+      const engine = optTtsEngine.value;
+      if (engine !== "say" && engine !== "piper") {
+        setSettingsStatus("Valor invalido: ttsEngine", "error");
+        return;
+      }
+      payload.ttsEngine = engine;
+    }
     if (optTtsRate) {
       const rate = Number(optTtsRate.value);
       if (!Number.isFinite(rate)) {
@@ -519,6 +551,24 @@ if (saveSettings) {
       payload.ttsRate = Math.min(2, Math.max(0.5, rate));
     }
     if (optTtsVoice) payload.ttsVoice = optTtsVoice.value || "";
+    if (optPiperModelPath) payload.piperModelPath = optPiperModelPath.value || "";
+    if (optPiperLengthScale) {
+      const n = Number(optPiperLengthScale.value);
+      if (!Number.isFinite(n)) {
+        setSettingsStatus("Valor invalido: piperLengthScale", "error");
+        return;
+      }
+      payload.piperLengthScale = Math.min(2, Math.max(0.5, n));
+    }
+    if (optPiperVolume) {
+      const n = Number(optPiperVolume.value);
+      if (!Number.isFinite(n)) {
+        setSettingsStatus("Valor invalido: piperVolume", "error");
+        return;
+      }
+      payload.piperVolume = Math.min(2, Math.max(0, n));
+    }
+    if (optPiperPythonCmd) payload.piperPythonCmd = optPiperPythonCmd.value || "py";
 
     setSettingsStatus("Guardando...", "info");
     try {

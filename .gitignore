@@ -145,3 +145,4 @@ dist
 
 data/settings.json
 .vscode/
+.venv/
