@@ -3,6 +3,11 @@ const socket = io();
 const statusEl = document.getElementById("status");
 const liveStatus = document.getElementById("liveStatus");
 const darkToggle = document.getElementById("darkToggle");
+const openOptions = document.getElementById("openOptions");
+const closeOptions = document.getElementById("closeOptions");
+const optionsPanel = document.getElementById("optionsPanel");
+const optionsOverlay = document.getElementById("optionsOverlay");
+const contentRoot = document.getElementById("contentRoot");
 const queueBody = document.getElementById("queueBody");
 const bansBody = document.getElementById("bansBody");
 const logEl = document.getElementById("log");
@@ -44,6 +49,8 @@ const testBtn = document.getElementById("testBtn");
 const testStatus = document.getElementById("testStatus");
 
 const THEME_KEY = "theme";
+const OPTIONS_KEY = "optionsOpen";
+const PUSH_CLASSES = ["lg:-translate-x-48", "xl:-translate-x-64"];
 const LIVE_PILL_BASE = "inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold shadow-sm transition";
 const LIVE_STYLES = {
   online: "border-emerald-200/80 bg-emerald-50 text-emerald-700 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-200",
@@ -85,6 +92,24 @@ function applyTheme(mode) {
     darkToggle.textContent = mode === "dark" ? "Modo claro" : "Modo oscuro";
   }
   localStorage.setItem(THEME_KEY, mode);
+}
+
+function setOptionsOpen(isOpen) {
+  if (!optionsPanel || !optionsOverlay) return;
+  optionsPanel.classList.toggle("translate-x-full", !isOpen);
+  optionsOverlay.classList.toggle("opacity-0", !isOpen);
+  optionsOverlay.classList.toggle("pointer-events-none", !isOpen);
+  optionsPanel.setAttribute("aria-hidden", String(!isOpen));
+  if (openOptions) {
+    openOptions.setAttribute("aria-expanded", String(isOpen));
+  }
+  if (contentRoot) {
+    for (const cls of PUSH_CLASSES) {
+      contentRoot.classList.toggle(cls, isOpen);
+    }
+  }
+  document.body.classList.toggle("overflow-hidden", isOpen);
+  localStorage.setItem(OPTIONS_KEY, isOpen ? "open" : "closed");
 }
 
 function initTheme() {
@@ -163,6 +188,23 @@ if (darkToggle) {
   });
 }
 initTheme();
+const savedOptions = localStorage.getItem(OPTIONS_KEY);
+if (savedOptions === "open") {
+  setOptionsOpen(true);
+}
+
+if (openOptions) {
+  openOptions.addEventListener("click", () => setOptionsOpen(true));
+}
+if (closeOptions) {
+  closeOptions.addEventListener("click", () => setOptionsOpen(false));
+}
+if (optionsOverlay) {
+  optionsOverlay.addEventListener("click", () => setOptionsOpen(false));
+}
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") setOptionsOpen(false);
+});
 
 socket.on("status", (s) => {
   ttsEnabled = !!s.ttsEnabled;
