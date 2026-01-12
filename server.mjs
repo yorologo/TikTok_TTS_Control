@@ -9,7 +9,10 @@ import { Server as SocketIOServer } from "socket.io";
 import say from "say";
 import TikTokLive from "tiktok-live-connector";
 
-const { TikTokLiveConnection, WebcastEvent } = TikTokLive;
+const { WebcastPushConnection } = TikTokLive;
+const WebcastEvent = {
+  CHAT: "chat"
+};
 
 // ---------- Helpers ----------
 const __filename = fileURLToPath(import.meta.url);
@@ -215,6 +218,14 @@ fs.watchFile(BANNED_PATH, { interval: 1500 }, () => {
 function stripDiacritics(s) {
   return s.normalize("NFD").replace(/\p{Diacritic}/gu, "");
 }
+function normalizeForTts(s) {
+  if (!s) return "";
+  let t = String(s);
+  t = t.replace(/[\u200B-\u200D\uFEFF]/g, "");
+  t = stripDiacritics(t);
+  t = t.replace(/\s+/g, " ").trim();
+  return t;
+}
 function normalizeForModeration(s) {
   let t = s.toLowerCase();
   t = t.replace(/[\u200B-\u200D\uFEFF]/g, "");
@@ -254,6 +265,7 @@ const RE_MENTION = /@\w+/u;
 const RE_SPAM_REPEAT = /(.)\1{4,}/u;
 const RE_PUNCT_SPAM = /[!?¿¡]{4,}/u;
 const RE_ALLOWED = /^[\p{Script=Latin}\p{N}\s.,!?¿¡'":;()\-\+]{1,200}$/u;
+const RE_DISALLOWED = /[^\p{Script=Latin}\p{N}\s.,!?¿¡'":;()\-\+]+/gu;
 
 const BANNED_SPACED = new Set([
   "puta",
@@ -412,16 +424,18 @@ function speakWithSay(text) {
 }
 
 async function speakMessage(text) {
+  const ttsText = normalizeForTts(text);
+  if (!ttsText) return;
   if (settings.ttsEngine === "piper") {
     try {
-      await speakWithPiper(text, settings.piper);
+      await speakWithPiper(ttsText, settings.piper);
       return;
     } catch (err) {
       pushLog({ type: "tts_error", error: String(err), engine: "piper" });
     }
   }
 
-  await speakWithSay(text);
+  await speakWithSay(ttsText);
 }
 
 async function speakNext() {
@@ -482,10 +496,12 @@ function filterChatText(raw) {
   if (RE_SPAM_REPEAT.test(clipped)) return { ok: false, reason: "repeat_spam" };
   if (RE_PUNCT_SPAM.test(clipped)) return { ok: false, reason: "punct_spam" };
 
-  // allowlist (si quieres permitir emojis, habría que ajustarla)
-  if (!RE_ALLOWED.test(clipped)) return { ok: false, reason: "chars" };
+  // strip unsupported chars (e.g., emojis) but keep the text
+  const cleaned = clipped.replace(RE_DISALLOWED, " ").replace(/\s+/g, " ").trim();
+  if (!cleaned) return { ok: false, reason: "empty_norm" };
+  if (!RE_ALLOWED.test(cleaned)) return { ok: false, reason: "chars" };
 
-  const norm = normalizeForModeration(clipped);
+  const norm = normalizeForModeration(cleaned);
   const tokens = tokenize(norm);
 
   if (tokens.length === 0) return { ok: false, reason: "empty_norm" };
@@ -495,7 +511,7 @@ function filterChatText(raw) {
   if (hasBannedExact(tokens)) return { ok: false, reason: "badword_exact" };
   if (hasBannedJoined(norm)) return { ok: false, reason: "badword_joined" };
 
-  return { ok: true, text: clipped };
+  return { ok: true, text: cleaned };
 }
 
 // ---------- Web server + sockets ----------
@@ -852,7 +868,7 @@ async function connectTikTok() {
     try { tiktokConn.disconnect(); } catch {}
   }
 
-  tiktokConn = new TikTokLiveConnection(settings.tiktokUsername);
+  tiktokConn = new WebcastPushConnection(settings.tiktokUsername);
   updateTikTokStatus({ status: "connecting", live: false, lastError: null, roomId: null });
   try {
     const state = await tiktokConn.connect();
