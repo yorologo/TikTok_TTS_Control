@@ -158,6 +158,7 @@ const DEFAULT_SETTINGS = {
   maxQueue: 6,
   maxChars: 80,
   maxWords: 14,
+  historySize: 25,
   ttsEngine: "say",
   ttsVoice: "",
   ttsRate: 1.0,
@@ -216,6 +217,7 @@ function stripDiacritics(s) {
 }
 function normalizeForModeration(s) {
   let t = s.toLowerCase();
+  t = t.replace(/[\u200B-\u200D\uFEFF]/g, "");
   t = stripDiacritics(t);
 
   // leetspeak básico
@@ -226,23 +228,55 @@ function normalizeForModeration(s) {
     .replace(/4/g, "a")
     .replace(/5/g, "s")
     .replace(/7/g, "t")
+    .replace(/8/g, "b")
     .replace(/\$/g, "s")
     .replace(/@/g, "a");
 
   t = t.replace(/[^\p{L}\p{N}\s]+/gu, " ");
+  t = t.replace(/([a-z])\1{2,}/g, "$1$1");
   t = t.replace(/\s+/g, " ").trim();
   return t;
 }
 function tokenize(norm) {
   return norm.split(" ").filter(Boolean);
 }
+function sanitizeBadword(word) {
+  if (!word) return "";
+  const ascii = stripDiacritics(String(word).toLowerCase());
+  return ascii.replace(/[^a-z0-9]+/g, "").trim();
+}
 
 // ---------- Filtros rápidos ----------
 const RE_URL = /(https?:\/\/|www\.|\.com|\.net|\.gg|\.ru|\.mx|\.xyz)/i;
+const RE_EMAIL = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
+const RE_PHONE = /\b\d{10}\b/;
 const RE_MENTION = /@\w+/u;
 const RE_SPAM_REPEAT = /(.)\1{4,}/u;
 const RE_PUNCT_SPAM = /[!?¿¡]{4,}/u;
 const RE_ALLOWED = /^[\p{Script=Latin}\p{N}\s.,!?¿¡'":;()\-\+]{1,200}$/u;
+
+const BANNED_SPACED = new Set([
+  "puta",
+  "puto",
+  "verga",
+  "mierda",
+  "pendejo",
+  "pendeja",
+  "chingada",
+  "chingar",
+  "cabron",
+  "culero",
+  "pinche",
+  "mamada",
+  "mamon",
+  "ojete",
+  "imbecil",
+  "estupido",
+  "hdp",
+  "ptm",
+  "alv",
+  "vtlv"
+]);
 
 // ---------- Ban logic ----------
 function nowMs() { return Date.now(); }
@@ -298,11 +332,37 @@ let lastGlobalSpeak = 0;
 const lastUserSpeak = new Map(); // uniqueId -> ts
 const queue = []; // {id, uniqueId, nickname, text, ts}
 const recentLog = []; // últimos 200 eventos para UI
+const recentHistory = []; // últimos N mensajes para UI
+let nextHistoryId = 1;
 
 function pushLog(evt) {
   recentLog.push({ ...evt, ts: nowMs() });
   while (recentLog.length > 200) recentLog.shift();
   io.emit("log", evt);
+}
+
+function buildHistoryEntry(entry) {
+  const comment = entry.comment || "";
+  const norm = normalizeForModeration(comment);
+  const tokens = tokenize(norm);
+  return {
+    id: nextHistoryId++,
+    ts: nowMs(),
+    uniqueId: entry.uniqueId,
+    nickname: entry.nickname,
+    comment,
+    source: entry.source || "tiktok",
+    status: entry.status,
+    reason: entry.reason || "",
+    tokens
+  };
+}
+
+function pushHistory(entry) {
+  const item = buildHistoryEntry(entry);
+  recentHistory.push(item);
+  while (recentHistory.length > (settings.historySize ?? 25)) recentHistory.shift();
+  io.emit("history", item);
 }
 
 let nextMsgId = 1;
@@ -397,6 +457,12 @@ function hasBannedJoined(norm) {
   }
   return false;
 }
+function hasBannedSpaced(tokens) {
+  if (tokens.length < 3) return false;
+  if (!tokens.every(t => t.length === 1)) return false;
+  const joined = tokens.join("");
+  return BANNED_SPACED.has(joined);
+}
 
 // Devuelve null si se bloquea, o texto final si pasa
 function filterChatText(raw) {
@@ -410,6 +476,8 @@ function filterChatText(raw) {
 
   // bloqueos rápidos
   if (RE_URL.test(clipped)) return { ok: false, reason: "url" };
+  if (RE_EMAIL.test(clipped)) return { ok: false, reason: "email" };
+  if (RE_PHONE.test(clipped)) return { ok: false, reason: "phone" };
   if (RE_MENTION.test(clipped)) return { ok: false, reason: "mention" };
   if (RE_SPAM_REPEAT.test(clipped)) return { ok: false, reason: "repeat_spam" };
   if (RE_PUNCT_SPAM.test(clipped)) return { ok: false, reason: "punct_spam" };
@@ -423,6 +491,7 @@ function filterChatText(raw) {
   if (tokens.length === 0) return { ok: false, reason: "empty_norm" };
   if (tokens.length > settings.maxWords) return { ok: false, reason: "too_many_words" };
 
+  if (hasBannedSpaced(tokens)) return { ok: false, reason: "badword_spaced" };
   if (hasBannedExact(tokens)) return { ok: false, reason: "badword_exact" };
   if (hasBannedJoined(norm)) return { ok: false, reason: "badword_joined" };
 
@@ -440,6 +509,10 @@ const io = new SocketIOServer(httpServer);
 // Snapshots para UI
 function getQueueSnapshot() {
   return { ttsEnabled, speaking, size: queue.length, items: queue.slice(0, 20) };
+}
+function getHistorySnapshot() {
+  const limit = settings.historySize ?? 25;
+  return { size: recentHistory.length, items: recentHistory.slice(-limit) };
 }
 function getBansSnapshot() {
   return bannedDb;
@@ -460,6 +533,7 @@ function getSettingsSnapshot() {
     maxQueue: settings.maxQueue,
     maxChars: settings.maxChars,
     maxWords: settings.maxWords,
+    historySize: settings.historySize,
     ttsEngine: settings.ttsEngine,
     ttsRate: settings.ttsRate,
     ttsVoice: settings.ttsVoice,
@@ -507,6 +581,10 @@ function applySettingsUpdate(update) {
   if ("maxWords" in update) {
     const n = toInt(update.maxWords, settings.maxWords);
     next.maxWords = Math.max(1, n);
+  }
+  if ("historySize" in update) {
+    const n = toInt(update.historySize, settings.historySize ?? 25);
+    next.historySize = Math.max(5, n);
   }
   if ("ttsEngine" in update) {
     const v = String(update.ttsEngine ?? "").trim();
@@ -563,9 +641,13 @@ function applySettingsUpdate(update) {
     const removed = queue.pop();
     pushLog({ type: "queue_drop", reason: "queue_resize", msg: removed });
   }
+  while (recentHistory.length > (settings.historySize ?? 25)) {
+    recentHistory.shift();
+  }
 
   io.emit("settings", getSettingsSnapshot());
   io.emit("queue", getQueueSnapshot());
+  io.emit("historyBulk", getHistorySnapshot());
   io.emit("status", getStatusSnapshot());
   return { ok: true };
 }
@@ -634,12 +716,14 @@ app.post("/api/queue/test", (req, res) => {
   const b = isBanned(uid);
   if (b.banned) {
     pushLog({ type: "blocked_banned_user", source: "local", uniqueId: uid, nickname: name, comment: rawText, reason: b.entry?.reason });
+    pushHistory({ uniqueId: uid, nickname: name, comment: rawText, source: "local", status: "blocked", reason: b.entry?.reason || "banned" });
     return res.json({ ok: false, reason: "banned" });
   }
 
   const f = filterChatText(rawText);
   if (!f.ok) {
     pushLog({ type: "blocked_filter", source: "local", uniqueId: uid, nickname: name, comment: rawText, reason: f.reason, strikes: 0 });
+    pushHistory({ uniqueId: uid, nickname: name, comment: rawText, source: "local", status: "blocked", reason: f.reason });
     return res.json({ ok: false, reason: f.reason });
   }
 
@@ -657,8 +741,10 @@ app.post("/api/queue/test", (req, res) => {
     const ok = enqueueMessage(msg);
     if (ok) {
       added += 1;
+      pushHistory({ uniqueId: uid, nickname: name, comment: rawText, source: "local", status: "queued", reason: "" });
     } else {
       dropped += 1;
+      pushHistory({ uniqueId: uid, nickname: name, comment: rawText, source: "local", status: "dropped", reason: "queue_full" });
       break;
     }
   }
@@ -701,11 +787,35 @@ app.post("/api/lists", (req, res) => {
   if (typeof sub === "string") fs.writeFileSync(BAD_SUB_PATH, sub.replace(/\r/g, ""), "utf8");
   res.json({ ok: true });
 });
+app.post("/api/badwords/add", (req, res) => {
+  const { word, mode } = req.body ?? {};
+  const cleaned = sanitizeBadword(word);
+  if (!cleaned || cleaned.length < 3) {
+    return res.status(400).json({ error: "word_invalida" });
+  }
+
+  const target = mode === "sub" ? "sub" : "exact";
+  const filePath = target === "sub" ? BAD_SUB_PATH : BAD_EXACT_PATH;
+  const lines = readLines(filePath);
+  if (!lines.includes(cleaned)) {
+    lines.push(cleaned);
+    fs.writeFileSync(filePath, lines.join("\n") + "\n", "utf8");
+  }
+
+  if (target === "sub") {
+    bannedSub = lines.map(s => s.toLowerCase()).filter(s => s.length >= 3);
+  } else {
+    bannedExact = new Set(lines.map(s => s.toLowerCase()));
+  }
+  io.emit("listsUpdated", getListsSnapshot());
+  res.json({ ok: true, word: cleaned, mode: target });
+});
 
 // Sockets
 io.on("connection", (socket) => {
   socket.emit("status", getStatusSnapshot());
   socket.emit("queue", getQueueSnapshot());
+  socket.emit("historyBulk", getHistorySnapshot());
   socket.emit("bansUpdated", getBansSnapshot());
   socket.emit("listsUpdated", getListsSnapshot());
   socket.emit("settings", getSettingsSnapshot());
@@ -764,6 +874,7 @@ async function connectTikTok() {
     const b = isBanned(uniqueId);
     if (b.banned) {
       pushLog({ type: "blocked_banned_user", uniqueId, nickname, comment, reason: b.entry?.reason });
+      pushHistory({ uniqueId, nickname, comment, status: "blocked", reason: b.entry?.reason || "banned" });
       return;
     }
 
@@ -772,12 +883,14 @@ async function connectTikTok() {
     if (!f.ok) {
       const strikeCount = addStrike(uniqueId);
       pushLog({ type: "blocked_filter", uniqueId, nickname, comment, reason: f.reason, strikes: strikeCount });
+      pushHistory({ uniqueId, nickname, comment, status: "blocked", reason: f.reason });
       return;
     }
 
     // cooldown
     if (!canSpeak(uniqueId)) {
       pushLog({ type: "blocked_cooldown", uniqueId, nickname, comment, reason: "cooldown" });
+      pushHistory({ uniqueId, nickname, comment, status: "blocked", reason: "cooldown" });
       return;
     }
 
@@ -788,7 +901,12 @@ async function connectTikTok() {
       text: f.text,
       ts: nowMs()
     };
-    enqueueMessage(msg);
+    const ok = enqueueMessage(msg);
+    if (ok) {
+      pushHistory({ uniqueId, nickname, comment, status: "queued", reason: "" });
+    } else {
+      pushHistory({ uniqueId, nickname, comment, status: "dropped", reason: "queue_full" });
+    }
   });
 
   tiktokConn.on("disconnected", () => {

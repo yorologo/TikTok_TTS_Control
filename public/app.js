@@ -11,6 +11,8 @@ const contentRoot = document.getElementById("contentRoot");
 const queueBody = document.getElementById("queueBody");
 const bansBody = document.getElementById("bansBody");
 const logEl = document.getElementById("log");
+const historyList = document.getElementById("historyList");
+const historyStatus = document.getElementById("historyStatus");
 
 const ttsToggle = document.getElementById("ttsToggle");
 const clearQueue = document.getElementById("clearQueue");
@@ -32,6 +34,7 @@ const optUserCooldown = document.getElementById("optUserCooldown");
 const optMaxQueue = document.getElementById("optMaxQueue");
 const optMaxChars = document.getElementById("optMaxChars");
 const optMaxWords = document.getElementById("optMaxWords");
+const optHistorySize = document.getElementById("optHistorySize");
 const optTtsEngine = document.getElementById("optTtsEngine");
 const optTtsRate = document.getElementById("optTtsRate");
 const optTtsVoice = document.getElementById("optTtsVoice");
@@ -85,8 +88,18 @@ const VOICE_STATUS_STYLES = {
   error: "text-rose-600 dark:text-rose-400",
   info: "text-slate-500 dark:text-slate-400"
 };
+const HISTORY_CARD = "rounded-xl border border-slate-200/80 bg-white/80 p-3 text-sm shadow-sm dark:border-slate-800/80 dark:bg-slate-900/70";
+const HISTORY_STATUS_PILL = "inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold";
+const HISTORY_STATUS_STYLES = {
+  queued: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-200",
+  blocked: "bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-200",
+  dropped: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-200"
+};
+const HISTORY_CHIP = "inline-flex items-center rounded-full border border-slate-200 px-2 py-0.5 text-xs font-semibold text-slate-600 hover:text-rose-600 dark:border-slate-800 dark:text-slate-300 dark:hover:text-rose-300";
 
 let ttsEnabled = true;
+let historyItems = [];
+let historyMax = 25;
 
 function applyTheme(mode) {
   const root = document.documentElement;
@@ -162,6 +175,95 @@ function setTtsEngineState(engine) {
   if (saySettings) saySettings.classList.toggle("hidden", usePiper);
 }
 
+function formatHistoryTime(ts) {
+  if (!ts) return "";
+  return new Date(ts).toLocaleTimeString();
+}
+
+function renderHistory() {
+  if (!historyList) return;
+  const items = historyItems.slice(-historyMax);
+  historyList.innerHTML = "";
+  if (historyStatus) {
+    historyStatus.textContent = `Mostrando ${items.length} / ${historyMax}`;
+  }
+  if (items.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "text-xs text-slate-500 dark:text-slate-400";
+    empty.textContent = "Sin mensajes recientes.";
+    historyList.appendChild(empty);
+    return;
+  }
+
+  for (const item of items) {
+    const card = document.createElement("div");
+    card.className = HISTORY_CARD;
+
+    const header = document.createElement("div");
+    header.className = "flex flex-wrap items-center justify-between gap-2";
+
+    const meta = document.createElement("div");
+    meta.className = "flex flex-wrap items-center gap-2";
+
+    const status = document.createElement("span");
+    const statusStyle = HISTORY_STATUS_STYLES[item.status] || HISTORY_STATUS_STYLES.queued;
+    status.className = `${HISTORY_STATUS_PILL} ${statusStyle}`;
+    status.textContent = item.status || "queued";
+
+    const user = document.createElement("span");
+    user.className = "text-xs text-slate-500 dark:text-slate-400";
+    user.textContent = `@${item.uniqueId || "unknown"}`;
+
+    const time = document.createElement("span");
+    time.className = "text-xs text-slate-400 dark:text-slate-500";
+    time.textContent = formatHistoryTime(item.ts);
+
+    meta.appendChild(status);
+    meta.appendChild(user);
+    meta.appendChild(time);
+
+    const actions = document.createElement("div");
+    actions.className = "flex flex-wrap items-center gap-2";
+
+    const banUserBtn = document.createElement("button");
+    banUserBtn.className = BTN_BAN;
+    banUserBtn.textContent = "Ban usuario";
+    banUserBtn.setAttribute("data-action", "ban-user");
+    banUserBtn.setAttribute("data-uid", item.uniqueId || "");
+
+    actions.appendChild(banUserBtn);
+    header.appendChild(meta);
+    header.appendChild(actions);
+
+    const body = document.createElement("div");
+    body.className = "mt-2 break-words text-sm text-slate-700 dark:text-slate-200";
+    body.textContent = item.comment || "";
+
+    const reason = document.createElement("div");
+    reason.className = "mt-1 text-xs text-slate-500 dark:text-slate-400";
+    reason.textContent = item.reason ? `Motivo: ${item.reason}` : "";
+
+    const tokensWrap = document.createElement("div");
+    tokensWrap.className = "mt-2 flex flex-wrap gap-2";
+    const tokens = Array.isArray(item.tokens) ? item.tokens : [];
+    const uniqueTokens = Array.from(new Set(tokens.filter(t => t.length >= 3))).slice(0, 10);
+    for (const token of uniqueTokens) {
+      const tokenBtn = document.createElement("button");
+      tokenBtn.className = HISTORY_CHIP;
+      tokenBtn.textContent = token;
+      tokenBtn.setAttribute("data-action", "ban-word");
+      tokenBtn.setAttribute("data-word", token);
+      tokensWrap.appendChild(tokenBtn);
+    }
+
+    card.appendChild(header);
+    card.appendChild(body);
+    if (reason.textContent) card.appendChild(reason);
+    if (tokensWrap.children.length > 0) card.appendChild(tokensWrap);
+    historyList.appendChild(card);
+  }
+}
+
 function setVoicesStatus(message, variant) {
   if (!voicesStatus) return;
   const style = VOICE_STATUS_STYLES[variant] || VOICE_STATUS_STYLES.info;
@@ -177,6 +279,10 @@ function applySettingsToForm(s) {
   if (optMaxQueue) optMaxQueue.value = s.maxQueue ?? "";
   if (optMaxChars) optMaxChars.value = s.maxChars ?? "";
   if (optMaxWords) optMaxWords.value = s.maxWords ?? "";
+  if (optHistorySize) optHistorySize.value = s.historySize ?? "";
+  if (Number.isFinite(Number(s.historySize))) {
+    historyMax = Number(s.historySize);
+  }
   if (optTtsEngine) optTtsEngine.value = s.ttsEngine || "say";
   if (optTtsRate) optTtsRate.value = s.ttsRate ?? "";
   if (optPiperModelPath) optPiperModelPath.value = s.piperModelPath ?? "";
@@ -189,6 +295,7 @@ function applySettingsToForm(s) {
   setTtsEngineState(optTtsEngine ? optTtsEngine.value : s.ttsEngine);
   pendingVoice = s.ttsVoice ?? "";
   if (optTtsVoice) optTtsVoice.value = pendingVoice;
+  renderHistory();
 }
 
 function addLogLine(obj) {
@@ -331,6 +438,19 @@ socket.on("queue", (q) => {
   });
 });
 
+socket.on("historyBulk", (payload) => {
+  historyItems = payload?.items || [];
+  renderHistory();
+});
+
+socket.on("history", (item) => {
+  historyItems.push(item);
+  if (historyItems.length > historyMax) {
+    historyItems = historyItems.slice(-historyMax);
+  }
+  renderHistory();
+});
+
 socket.on("bansUpdated", (db) => {
   bansBody.innerHTML = "";
   const users = db.users || {};
@@ -378,6 +498,33 @@ socket.on("logBulk", (items) => {
 socket.on("log", (evt) => addLogLine(evt));
 
 // botones
+if (historyList) {
+  historyList.addEventListener("click", async (event) => {
+    const target = event.target.closest("[data-action]");
+    if (!target) return;
+    const action = target.getAttribute("data-action");
+    if (action === "ban-user") {
+      const uid = target.getAttribute("data-uid");
+      if (!uid) return;
+      await fetch("/api/ban", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ uniqueId: uid, minutes: 60, reason: "manual (historial)" })
+      });
+      if (historyStatus) historyStatus.textContent = `Baneado: @${uid}`;
+    }
+    if (action === "ban-word") {
+      const word = target.getAttribute("data-word");
+      if (!word) return;
+      await fetch("/api/badwords/add", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ word, mode: "exact" })
+      });
+      if (historyStatus) historyStatus.textContent = `Palabra agregada: ${word}`;
+    }
+  });
+}
 if (ttsToggle) {
   ttsToggle.addEventListener("click", async () => {
     await fetch("/api/tts", {
@@ -520,6 +667,7 @@ if (saveSettings) {
       { el: optMaxQueue, key: "maxQueue", min: 1 },
       { el: optMaxChars, key: "maxChars", min: 1 },
       { el: optMaxWords, key: "maxWords", min: 1 },
+      { el: optHistorySize, key: "historySize", min: 5 },
       { el: optAutoBanStrikes, key: "autoBanStrikeThreshold", min: 1 },
       { el: optAutoBanMinutes, key: "autoBanBanMinutes", min: 1 }
     ];
