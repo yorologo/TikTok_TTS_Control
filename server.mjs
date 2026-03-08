@@ -1,4 +1,4 @@
-﻿import fs from "fs";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import os from "os";
@@ -6,7 +6,6 @@ import { execFile, spawn } from "child_process";
 import express from "express";
 import { createServer } from "http";
 import { Server as SocketIOServer } from "socket.io";
-import say from "say";
 import TikTokLive from "tiktok-live-connector";
 
 const { WebcastPushConnection } = TikTokLive;
@@ -15,7 +14,7 @@ const WebcastEvent = {
   CHAT: "chat"
 };
 
-// -------------------- Paths & Defaults --------------------
+// -------------------- Paths & Runtime --------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -24,6 +23,75 @@ const SETTINGS_PATH = path.join(DATA_DIR, "settings.json");
 const BANNED_PATH = path.join(DATA_DIR, "banned_users.json");
 const BAD_EXACT_PATH = path.join(DATA_DIR, "badwords_exact_es.txt");
 const BAD_SUB_PATH = path.join(DATA_DIR, "badwords_substring_es.txt");
+
+const SUPPORTED_TTS_ENGINES = new Set(["say", "piper", "termux"]);
+const TERMUX_STREAMS = new Set(["ALARM", "MUSIC", "NOTIFICATION", "RING", "SYSTEM", "VOICE_CALL"]);
+const OUTPUT_MODES = new Set(["media", "notification", "auto"]);
+const COEXISTENCE_MODES = new Set(["duck", "pause", "best-effort"]);
+const PERSIST_SCOPES = new Set(["global", "session"]);
+
+const MIN_TTS_RATE = 0.5;
+const MAX_TTS_RATE = 2.0;
+const MIN_TTS_PITCH = 0.5;
+const MAX_TTS_PITCH = 2.0;
+const MAX_TERMUX_TEXT_LEN = 240;
+const TTS_TEST_MAX_LEN = 220;
+const TERMUX_DEFAULT_STREAM = "MUSIC";
+const TTS_CMD_TIMEOUT_MS = 90000;
+
+function commandExistsSync(cmd) {
+  if (!cmd) return false;
+  const pathValue = process.env.PATH || "";
+  for (const dir of pathValue.split(path.delimiter)) {
+    if (!dir) continue;
+    try {
+      fs.accessSync(path.join(dir, cmd), fs.constants.X_OK);
+      return true;
+    } catch {}
+  }
+  return false;
+}
+
+const RUNTIME_CAPS = Object.freeze({
+  platform: process.platform,
+  isTermux: process.platform === "android" || String(process.env.PREFIX || "").includes("com.termux"),
+  hasTermuxTts: commandExistsSync("termux-tts-speak"),
+  hasTermuxTtsEngines: commandExistsSync("termux-tts-engines"),
+  hasTermuxMediaPlayer: commandExistsSync("termux-media-player"),
+  hasAplay: commandExistsSync("aplay"),
+  hasPaplay: commandExistsSync("paplay"),
+  hasAfplay: commandExistsSync("afplay"),
+  hasPowerShell: commandExistsSync("powershell")
+});
+
+function getRecommendedEngine() {
+  if (RUNTIME_CAPS.hasTermuxTts) return "termux";
+  if (RUNTIME_CAPS.platform === "win32" || RUNTIME_CAPS.platform === "darwin" || RUNTIME_CAPS.platform === "linux") {
+    return "say";
+  }
+  return "piper";
+}
+
+function getAvailableEngines() {
+  const out = ["piper"];
+  if (RUNTIME_CAPS.hasTermuxTts) out.push("termux");
+  if (RUNTIME_CAPS.platform !== "android") out.push("say");
+  return out;
+}
+
+function getRuntimeSnapshot() {
+  return {
+    platform: RUNTIME_CAPS.platform,
+    isTermux: !!RUNTIME_CAPS.isTermux,
+    hasTermuxTts: !!RUNTIME_CAPS.hasTermuxTts,
+    hasTermuxTtsEngines: !!RUNTIME_CAPS.hasTermuxTtsEngines,
+    availableTtsEngines: getAvailableEngines(),
+    recommendedTtsEngine: getRecommendedEngine()
+  };
+}
+
+const DEFAULT_TTS_ENGINE = getRecommendedEngine();
+const DEFAULT_PIPER_PYTHON_CMD = process.platform === "win32" ? "py" : "python";
 
 const DEFAULT_SETTINGS = {
   tiktokUsername: "TU_USUARIO_SIN_ARROBA",
@@ -38,7 +106,7 @@ const DEFAULT_SETTINGS = {
   maxWords: 14,
   historySize: 25,
 
-  ttsEngine: "say", // "say" | "piper"
+  ttsEngine: DEFAULT_TTS_ENGINE,
   ttsVoice: "",
   ttsRate: 1.0,
 
@@ -46,7 +114,19 @@ const DEFAULT_SETTINGS = {
     modelPath: "",
     lengthScale: 1.0,
     volume: 1.0,
-    pythonCmd: "py" // o "python"
+    pythonCmd: DEFAULT_PIPER_PYTHON_CMD
+  },
+
+  termux: {
+    engine: "",
+    language: "",
+    region: "",
+    variant: "",
+    pitch: 1.0,
+    rate: 1.0,
+    stream: TERMUX_DEFAULT_STREAM,
+    outputMode: "media",
+    coexistenceMode: "duck"
   },
 
   autoBan: {
@@ -115,6 +195,92 @@ function toInt(value, fallback) {
   return Number.isFinite(n) ? Math.trunc(n) : fallback;
 }
 
+function sanitizeTermuxStream(value, fallback = TERMUX_DEFAULT_STREAM) {
+  const v = String(value || fallback || TERMUX_DEFAULT_STREAM).trim().toUpperCase();
+  return TERMUX_STREAMS.has(v) ? v : TERMUX_DEFAULT_STREAM;
+}
+
+function sanitizeMode(value, allowed, fallback) {
+  const raw = String(value || fallback || "").trim().toLowerCase();
+  return allowed.has(raw) ? raw : fallback;
+}
+
+function sanitizeSimpleToken(value, maxLen = 64) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  const clean = raw.replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, maxLen);
+  return clean;
+}
+
+function sanitizeLocaleToken(value, kind) {
+  const token = sanitizeSimpleToken(value, 16);
+  if (!token) return "";
+
+  if (kind === "language") {
+    const upper = token.toLowerCase();
+    if (/^[a-z]{2,3}$/.test(upper)) return upper;
+    return "";
+  }
+
+  if (kind === "region") {
+    const upper = token.toUpperCase();
+    if (/^[A-Z]{2,3}$/.test(upper)) return upper;
+    return "";
+  }
+
+  return token;
+}
+
+function normalizeTermuxConfig(raw = {}, fallback = DEFAULT_SETTINGS.termux) {
+  const merged = { ...(fallback || {}), ...(raw || {}) };
+
+  return {
+    engine: sanitizeSimpleToken(merged.engine, 96),
+    language: sanitizeLocaleToken(merged.language, "language"),
+    region: sanitizeLocaleToken(merged.region, "region"),
+    variant: sanitizeSimpleToken(merged.variant, 64),
+    stream: sanitizeTermuxStream(merged.stream, fallback?.stream || TERMUX_DEFAULT_STREAM),
+    pitch: clampNumber(merged.pitch, MIN_TTS_PITCH, MAX_TTS_PITCH, fallback?.pitch ?? 1.0),
+    rate: clampNumber(merged.rate, MIN_TTS_RATE, MAX_TTS_RATE, fallback?.rate ?? 1.0),
+    outputMode: sanitizeMode(merged.outputMode, OUTPUT_MODES, fallback?.outputMode || "media"),
+    coexistenceMode: sanitizeMode(merged.coexistenceMode, COEXISTENCE_MODES, fallback?.coexistenceMode || "duck")
+  };
+}
+
+function resolveTermuxStream(config) {
+  const outputMode = sanitizeMode(config?.outputMode, OUTPUT_MODES, "media");
+
+  if (outputMode === "media") return "MUSIC";
+  if (outputMode === "notification") return "NOTIFICATION";
+
+  const fallback = sanitizeMode(config?.coexistenceMode, COEXISTENCE_MODES, "duck") === "pause"
+    ? "NOTIFICATION"
+    : TERMUX_DEFAULT_STREAM;
+
+  return sanitizeTermuxStream(config?.stream, fallback);
+}
+
+function getSafeError(err, fallback = "unknown_error") {
+  const text = String(err?.message || err || fallback).replace(/[\r\n\t]+/g, " ").trim();
+  return text.slice(0, 280) || fallback;
+}
+
+function validateTextForSpeech(rawText, maxLen = MAX_TERMUX_TEXT_LEN) {
+  return normalizeForTts(String(rawText || "")).slice(0, maxLen);
+}
+
+function normalizePiperModelPath(rawPath) {
+  const raw = String(rawPath || "").trim();
+  if (!raw) return "";
+
+  if (process.platform !== "win32" && /^[A-Za-z]:[\\/]/.test(raw)) {
+    return "";
+  }
+
+  const normalized = raw.replace(/\\/g, path.sep);
+  return path.isAbsolute(normalized) ? normalized : path.resolve(__dirname, normalized);
+}
+
 // Debounce simple
 function debounce(fn, ms) {
   let t = null;
@@ -128,22 +294,42 @@ function debounce(fn, ms) {
 ensureDirSync(DATA_DIR);
 ensureFileIfMissing(SETTINGS_PATH, JSON.stringify(DEFAULT_SETTINGS, null, 2));
 ensureFileIfMissing(BANNED_PATH, JSON.stringify({ users: {} }, null, 2));
-ensureFileIfMissing(BAD_EXACT_PATH, ""); // lista vacía
-ensureFileIfMissing(BAD_SUB_PATH, "");   // lista vacía
+ensureFileIfMissing(BAD_EXACT_PATH, "");
+ensureFileIfMissing(BAD_SUB_PATH, "");
 
-let settings = readJson(SETTINGS_PATH, null) ?? { ...DEFAULT_SETTINGS };
-settings = {
+const rawSettings = readJson(SETTINGS_PATH, null) ?? { ...DEFAULT_SETTINGS };
+let settings = {
   ...DEFAULT_SETTINGS,
-  ...settings,
+  ...rawSettings,
   autoBan: {
     ...DEFAULT_SETTINGS.autoBan,
-    ...(settings.autoBan || {})
+    ...(rawSettings.autoBan || {})
   },
   piper: {
     ...DEFAULT_SETTINGS.piper,
-    ...(settings.piper || {})
+    ...(rawSettings.piper || {})
+  },
+  termux: {
+    ...DEFAULT_SETTINGS.termux,
+    ...(rawSettings.termux || {})
   }
 };
+
+if (!SUPPORTED_TTS_ENGINES.has(settings.ttsEngine)) {
+  settings.ttsEngine = DEFAULT_TTS_ENGINE;
+}
+
+if (!settings.piper.pythonCmd) {
+  settings.piper.pythonCmd = DEFAULT_PIPER_PYTHON_CMD;
+}
+
+settings.termux = normalizeTermuxConfig(settings.termux, DEFAULT_SETTINGS.termux);
+
+// Migración automática: configuración legacy "say" no funciona en Android/Termux.
+if (RUNTIME_CAPS.isTermux && settings.ttsEngine === "say") {
+  settings.ttsEngine = RUNTIME_CAPS.hasTermuxTts ? "termux" : "piper";
+}
+
 writeJsonAtomicSync(SETTINGS_PATH, settings);
 
 // -------------------- Server + Socket.IO (init early for safe emit) --------------------
@@ -152,59 +338,136 @@ app.use(express.json({ limit: "128kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 const httpServer = createServer(app);
-const io = new SocketIOServer(httpServer, {
-  // Puedes ajustar CORS si lo necesitas:
-  // cors: { origin: "http://localhost:8787" }
-});
+const io = new SocketIOServer(httpServer, {});
 
 function safeEmit(evt, payload) {
   try {
     io.emit(evt, payload);
-  } catch {
-    // no-op
-  }
+  } catch {}
 }
 
 // -------------------- State --------------------
 let bannedDb = readJson(BANNED_PATH, { users: {} });
 
 let bannedExact = new Set(readLines(BAD_EXACT_PATH).map((s) => s.toLowerCase()));
-// Nota: substring muy corto genera falsos positivos; 4+ suele ser un buen mínimo
 let bannedSub = readLines(BAD_SUB_PATH).map((s) => s.toLowerCase()).filter((s) => s.length >= 4);
 
-const strikes = new Map(); // uniqueId -> count
+const strikes = new Map();
 
 let ttsEnabled = !!settings.ttsEnabled;
 let speaking = false;
 let lastGlobalSpeak = 0;
-const lastUserSpeak = new Map(); // uniqueId -> ts
-const queue = []; // {id, uniqueId, nickname, text, ts, source}
-const recentLog = []; // últimos 200 eventos para UI
-const recentHistory = []; // últimos N mensajes para UI
+const lastUserSpeak = new Map();
+const queue = [];
+const recentLog = [];
+const recentHistory = [];
 let nextHistoryId = 1;
 let nextMsgId = 1;
+let sessionTermuxOverrides = {};
+
+function pickDefined(target, source, sourceKey, targetKey = sourceKey) {
+  if (!source || typeof source !== "object") return;
+  if (!Object.prototype.hasOwnProperty.call(source, sourceKey)) return;
+  target[targetKey] = source[sourceKey];
+}
+
+function extractTermuxConfigInput(payload = {}) {
+  const out = {};
+  const root = payload && typeof payload === "object" ? payload : {};
+  const nested = root.termux && typeof root.termux === "object" ? root.termux : {};
+
+  pickDefined(out, root, "engine");
+  pickDefined(out, root, "language");
+  pickDefined(out, root, "region");
+  pickDefined(out, root, "variant");
+  pickDefined(out, root, "stream");
+  pickDefined(out, root, "pitch");
+  pickDefined(out, root, "rate");
+  pickDefined(out, root, "outputMode");
+  pickDefined(out, root, "coexistenceMode");
+
+  pickDefined(out, root, "termuxEngine", "engine");
+  pickDefined(out, root, "termuxLanguage", "language");
+  pickDefined(out, root, "termuxRegion", "region");
+  pickDefined(out, root, "termuxVariant", "variant");
+  pickDefined(out, root, "termuxStream", "stream");
+  pickDefined(out, root, "termuxPitch", "pitch");
+  pickDefined(out, root, "termuxRate", "rate");
+  pickDefined(out, root, "termuxOutputMode", "outputMode");
+  pickDefined(out, root, "termuxCoexistenceMode", "coexistenceMode");
+
+  pickDefined(out, nested, "engine");
+  pickDefined(out, nested, "language");
+  pickDefined(out, nested, "region");
+  pickDefined(out, nested, "variant");
+  pickDefined(out, nested, "stream");
+  pickDefined(out, nested, "pitch");
+  pickDefined(out, nested, "rate");
+  pickDefined(out, nested, "outputMode");
+  pickDefined(out, nested, "coexistenceMode");
+
+  return out;
+}
+
+function getPersistedTermuxConfig() {
+  return normalizeTermuxConfig(settings.termux, DEFAULT_SETTINGS.termux);
+}
+
+function getEffectiveTermuxConfig(overrides = null) {
+  const persisted = getPersistedTermuxConfig();
+  const session = normalizeTermuxConfig(sessionTermuxOverrides, persisted);
+
+  if (!overrides || typeof overrides !== "object") {
+    return session;
+  }
+
+  return normalizeTermuxConfig(extractTermuxConfigInput(overrides), session);
+}
+
+function getResolvedTermuxSpeakConfig(overrides = null) {
+  const merged = getEffectiveTermuxConfig(overrides);
+  return {
+    ...merged,
+    effectiveStream: resolveTermuxStream(merged)
+  };
+}
+
+function getPersistScope(raw) {
+  const scope = String(raw || "global").trim().toLowerCase();
+  return PERSIST_SCOPES.has(scope) ? scope : "global";
+}
 
 // -------------------- Snapshots for UI --------------------
 function getQueueSnapshot() {
   return { ttsEnabled, speaking, size: queue.length, items: queue.slice(0, 20) };
 }
+
 function getHistorySnapshot() {
   const limit = settings.historySize ?? 25;
   return { size: recentHistory.length, items: recentHistory.slice(-limit) };
 }
+
 function getBansSnapshot() {
   return bannedDb;
 }
+
 function getListsSnapshot() {
   return {
     badwordsExact: Array.from(bannedExact.values()).slice(0, 200),
     badwordsSub: bannedSub.slice(0, 200)
   };
 }
+
 function getStatusSnapshot() {
-  return { ttsEnabled, speaking, queueSize: queue.length };
+  const isSpeaking = speaking || directTtsInProgress || speechLockDepth > 0;
+  return { ttsEnabled, speaking: isSpeaking, queueSize: queue.length, ttsEngine: settings.ttsEngine };
 }
+
 function getSettingsSnapshot() {
+  const persistedTermux = getPersistedTermuxConfig();
+  const effectiveTermux = getResolvedTermuxSpeakConfig();
+  const hasSessionOverrides = Object.keys(sessionTermuxOverrides || {}).length > 0;
+
   return {
     globalCooldownMs: settings.globalCooldownMs,
     perUserCooldownMs: settings.perUserCooldownMs,
@@ -212,16 +475,34 @@ function getSettingsSnapshot() {
     maxChars: settings.maxChars,
     maxWords: settings.maxWords,
     historySize: settings.historySize,
+
     ttsEngine: settings.ttsEngine,
     ttsRate: settings.ttsRate,
     ttsVoice: settings.ttsVoice,
+
     piperModelPath: settings.piper?.modelPath ?? "",
     piperLengthScale: settings.piper?.lengthScale ?? 1.0,
     piperVolume: settings.piper?.volume ?? 1.0,
-    piperPythonCmd: settings.piper?.pythonCmd ?? "py",
+    piperPythonCmd: settings.piper?.pythonCmd ?? DEFAULT_PIPER_PYTHON_CMD,
+
+    termuxEngine: effectiveTermux.engine,
+    termuxLanguage: effectiveTermux.language,
+    termuxRegion: effectiveTermux.region,
+    termuxVariant: effectiveTermux.variant,
+    termuxPitch: effectiveTermux.pitch,
+    termuxRate: effectiveTermux.rate,
+    termuxStream: effectiveTermux.stream,
+    termuxOutputMode: effectiveTermux.outputMode,
+    termuxCoexistenceMode: effectiveTermux.coexistenceMode,
+    termuxEffectiveStream: effectiveTermux.effectiveStream,
+    termuxPersistScope: hasSessionOverrides ? "session" : "global",
+    termuxPersistedConfig: persistedTermux,
+
     autoBanEnabled: settings.autoBan?.enabled ?? true,
     autoBanStrikeThreshold: settings.autoBan?.strikeThreshold ?? 2,
-    autoBanBanMinutes: settings.autoBan?.banMinutes ?? 30
+    autoBanBanMinutes: settings.autoBan?.banMinutes ?? 30,
+
+    runtime: getRuntimeSnapshot()
   };
 }
 
@@ -251,7 +532,6 @@ function normalizeForModeration(s) {
   t = t.replace(/[\u200B-\u200D\uFEFF]/g, "");
   t = stripDiacritics(t);
 
-  // leetspeak básico
   t = t
     .replace(/0/g, "o")
     .replace(/[1!|]/g, "i")
@@ -264,7 +544,7 @@ function normalizeForModeration(s) {
     .replace(/@/g, "a");
 
   t = t.replace(/[^\p{L}\p{N}\s]+/gu, " ");
-  t = t.replace(/([a-z])\1{2,}/g, "$1$1"); // reduce spam de letras
+  t = t.replace(/([a-z])\1{2,}/g, "$1$1");
   t = t.replace(/\s+/g, " ").trim();
   return t;
 }
@@ -313,7 +593,6 @@ const reloadBans = debounce(() => {
   safeEmit("bansUpdated", getBansSnapshot());
 }, 250);
 
-// watchFile es polling (estable en Windows). Si quieres fs.watch, se puede cambiar.
 fs.watchFile(BAD_EXACT_PATH, { interval: 1500 }, reloadExact);
 fs.watchFile(BAD_SUB_PATH, { interval: 1500 }, reloadSub);
 fs.watchFile(BANNED_PATH, { interval: 1500 }, reloadBans);
@@ -340,6 +619,7 @@ function hasBannedExact(tokens) {
   for (const w of tokens) if (bannedExact.has(w)) return true;
   return false;
 }
+
 function hasBannedJoined(norm) {
   const joined = norm.replace(/\s+/g, "");
   for (const bad of bannedSub) {
@@ -347,13 +627,13 @@ function hasBannedJoined(norm) {
   }
   return false;
 }
+
 function hasBannedSpaced(tokens) {
   if (tokens.length < 3) return false;
   if (!tokens.every((t) => t.length === 1)) return false;
   return BANNED_SPACED.has(tokens.join(""));
 }
 
-// Devuelve {ok:true,text} si pasa
 function filterChatText(raw) {
   if (!raw) return { ok: false, reason: "empty" };
 
@@ -362,7 +642,6 @@ function filterChatText(raw) {
 
   const clipped = trimmed.slice(0, settings.maxChars);
 
-  // bloqueos rápidos
   if (RE_URL.test(clipped)) return { ok: false, reason: "url" };
   if (RE_EMAIL.test(clipped)) return { ok: false, reason: "email" };
   if (RE_PHONE.test(clipped)) return { ok: false, reason: "phone" };
@@ -370,7 +649,6 @@ function filterChatText(raw) {
   if (RE_SPAM_REPEAT.test(clipped)) return { ok: false, reason: "repeat_spam" };
   if (RE_PUNCT_SPAM.test(clipped)) return { ok: false, reason: "punct_spam" };
 
-  // quitar chars no soportados (emoji etc) pero conservar texto
   const cleaned = clipped.replace(RE_DISALLOWED, " ").replace(/\s+/g, " ").trim();
   if (!cleaned) return { ok: false, reason: "empty_norm" };
   if (!RE_ALLOWED.test(cleaned)) return { ok: false, reason: "chars" };
@@ -427,7 +705,7 @@ function addStrike(uniqueId) {
 }
 
 // -------------------- Cooldowns & Queue --------------------
-function canSpeak(uniqueId) {
+function canSpeakNow(uniqueId) {
   const now = nowMs();
 
   if (now - lastGlobalSpeak < settings.globalCooldownMs) return false;
@@ -435,9 +713,13 @@ function canSpeak(uniqueId) {
   const last = lastUserSpeak.get(uniqueId) ?? 0;
   if (now - last < settings.perUserCooldownMs) return false;
 
+  return true;
+}
+
+function markSpeak(uniqueId) {
+  const now = nowMs();
   lastGlobalSpeak = now;
   lastUserSpeak.set(uniqueId, now);
-  return true;
 }
 
 function enqueueMessage(msg) {
@@ -447,7 +729,7 @@ function enqueueMessage(msg) {
   }
   queue.push(msg);
   safeEmit("queue", getQueueSnapshot());
-  startQueueWorker(); // asegura worker corriendo
+  startQueueWorker();
   return true;
 }
 
@@ -461,65 +743,372 @@ function skipQueueMessage(id) {
 }
 
 // -------------------- TTS engines --------------------
+let sayApi = null;
+let sayLoadError = null;
+
+async function loadSayApi() {
+  if (sayApi) return sayApi;
+  if (sayLoadError) throw sayLoadError;
+
+  if (process.platform === "android") {
+    sayLoadError = new Error("say_unsupported_platform_android");
+    throw sayLoadError;
+  }
+
+  try {
+    const mod = await import("say");
+    const api = mod?.default ?? mod;
+    if (!api || typeof api.speak !== "function") {
+      throw new Error("say_invalid_module");
+    }
+    sayApi = api;
+    return sayApi;
+  } catch (err) {
+    sayLoadError = err instanceof Error ? err : new Error(String(err));
+    throw sayLoadError;
+  }
+}
+
 function getInstalledVoicesWin() {
   return new Promise((resolve) => {
+    if (!RUNTIME_CAPS.hasPowerShell) {
+      resolve({ voices: [], error: "powershell_not_found", source: "win32" });
+      return;
+    }
+
     const command =
       "Add-Type -AssemblyName System.Speech; " +
       "$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer; " +
       "$synth.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo.Name }";
+
     execFile("powershell", ["-NoProfile", "-Command", command], { windowsHide: true }, (err, stdout) => {
-      if (err) return resolve({ voices: [], error: String(err) });
+      if (err) {
+        resolve({ voices: [], error: String(err), source: "win32" });
+        return;
+      }
       const voices = String(stdout || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-      resolve({ voices });
+      resolve({ voices, source: "win32" });
     });
   });
 }
 
-async function getInstalledVoices() {
-  const sayResult = await new Promise((resolve) => {
-    say.getInstalledVoices((err, voices) => {
-      if (err) return resolve({ voices: [], error: String(err) });
-      resolve({ voices: Array.isArray(voices) ? voices : [] });
+async function runProcess(cmd, args = [], inputText = null, options = {}) {
+  const timeoutMs = Number(options.timeoutMs || 0);
+  const onSpawn = typeof options.onSpawn === "function" ? options.onSpawn : null;
+
+  return await new Promise((resolve, reject) => {
+    const proc = spawn(cmd, args, { windowsHide: true });
+    if (onSpawn) {
+      try { onSpawn(proc); } catch {}
+    }
+
+    let stdout = "";
+    let stderr = "";
+    let finished = false;
+    let timeout = null;
+
+    const finalize = () => {
+      if (timeout) clearTimeout(timeout);
+      if (onSpawn) {
+        try { onSpawn(null); } catch {}
+      }
+    };
+
+    if (timeoutMs > 0) {
+      timeout = setTimeout(() => {
+        if (finished) return;
+        finished = true;
+        try { proc.kill("SIGKILL"); } catch {}
+        finalize();
+        reject(new Error(`${cmd} timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+    }
+
+    if (inputText !== null && inputText !== undefined && proc.stdin) {
+      try {
+        proc.stdin.write(inputText);
+      } catch {}
+      try {
+        proc.stdin.end();
+      } catch {}
+    } else if (proc.stdin) {
+      try {
+        proc.stdin.end();
+      } catch {}
+    }
+
+    proc.stdout?.on("data", (data) => {
+      stdout += data.toString();
+    });
+
+    proc.stderr?.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    proc.on("error", (err) => {
+      if (finished) return;
+      finished = true;
+      finalize();
+      reject(err instanceof Error ? err : new Error(String(err)));
+    });
+
+    proc.on("close", (code) => {
+      if (finished) return;
+      finished = true;
+      finalize();
+
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        const detail = String(stderr || stdout || "").trim();
+        reject(new Error(`${cmd} exited ${code}${detail ? `: ${detail}` : ""}`));
+      }
     });
   });
+}
 
+async function getInstalledVoicesSay() {
+  try {
+    const say = await loadSayApi();
+    return await new Promise((resolve) => {
+      say.getInstalledVoices((err, voices) => {
+        if (err) {
+          resolve({ voices: [], error: String(err), source: "say" });
+          return;
+        }
+        resolve({ voices: Array.isArray(voices) ? voices : [], source: "say" });
+      });
+    });
+  } catch (err) {
+    return { voices: [], error: String(err), source: "say" };
+  }
+}
+
+async function getInstalledTermuxEngines() {
+  if (!RUNTIME_CAPS.hasTermuxTtsEngines) {
+    return { voices: [], error: "termux_tts_engines_missing", source: "termux" };
+  }
+
+  try {
+    const { stdout } = await runProcess("termux-tts-engines", [], null, { timeoutMs: 7000 });
+    const parsed = JSON.parse(stdout || "[]");
+    const engines = Array.isArray(parsed)
+      ? parsed.map((e) => String(e?.name || "").trim()).filter(Boolean)
+      : [];
+
+    return {
+      voices: engines,
+      source: "termux",
+      meta: {
+        kind: "termux_engines",
+        engines: Array.isArray(parsed) ? parsed : []
+      }
+    };
+  } catch (err) {
+    return { voices: [], error: String(err), source: "termux" };
+  }
+}
+
+async function getInstalledVoices() {
+  if (settings.ttsEngine === "termux") {
+    const termuxResult = await getInstalledTermuxEngines();
+    if (termuxResult.voices.length > 0 || !termuxResult.error) {
+      return termuxResult;
+    }
+  }
+
+  const sayResult = await getInstalledVoicesSay();
   if (sayResult.voices.length > 0) return sayResult;
 
   if (process.platform === "win32") {
     const winResult = await getInstalledVoicesWin();
     if (winResult.voices.length > 0) return winResult;
-    return { voices: [], error: sayResult.error || winResult.error || "no_voices" };
+    return { voices: [], error: sayResult.error || winResult.error || "no_voices", source: "say" };
+  }
+
+  if (RUNTIME_CAPS.hasTermuxTtsEngines) {
+    const termuxResult = await getInstalledTermuxEngines();
+    if (termuxResult.voices.length > 0) {
+      return {
+        ...termuxResult,
+        error: sayResult.error || termuxResult.error
+      };
+    }
   }
 
   return sayResult;
 }
 
-function runProcess(cmd, args, inputText) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(cmd, args, { windowsHide: true });
-    let stderr = "";
-
-    if (inputText !== null && inputText !== undefined) {
-      proc.stdin.write(inputText);
-      proc.stdin.end();
-    }
-
-    proc.stderr.on("data", (data) => (stderr += data.toString()));
-    proc.on("error", reject);
-    proc.on("close", (code) => {
-      if (code === 0) return resolve();
-      reject(new Error(`${cmd} exited ${code}: ${stderr}`));
-    });
-  });
+function validateEnumField(rawValue, allowed, fieldName, errors) {
+  if (rawValue === undefined || rawValue === null || rawValue === "") return;
+  const v = String(rawValue).trim().toLowerCase();
+  if (!allowed.has(v)) errors.push({ field: fieldName, message: `valor_invalido: ${v}` });
 }
 
-async function speakWithPiper(text, options) {
-  const modelPath = options?.modelPath || "";
+async function validateTermuxConfig(rawConfig = {}, options = {}) {
+  const input = extractTermuxConfigInput(rawConfig);
+  const base = options.baseConfig && typeof options.baseConfig === "object"
+    ? normalizeTermuxConfig(options.baseConfig, DEFAULT_SETTINGS.termux)
+    : getEffectiveTermuxConfig();
+
+  const normalized = normalizeTermuxConfig(input, base);
+  const errors = [];
+  const warnings = [];
+
+  if (Object.prototype.hasOwnProperty.call(input, "pitch")) {
+    const n = Number(input.pitch);
+    if (!Number.isFinite(n) || n < MIN_TTS_PITCH || n > MAX_TTS_PITCH) {
+      errors.push({ field: "pitch", message: `fuera_de_rango_${MIN_TTS_PITCH}_${MAX_TTS_PITCH}` });
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(input, "rate")) {
+    const n = Number(input.rate);
+    if (!Number.isFinite(n) || n < MIN_TTS_RATE || n > MAX_TTS_RATE) {
+      errors.push({ field: "rate", message: `fuera_de_rango_${MIN_TTS_RATE}_${MAX_TTS_RATE}` });
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(input, "engine") && String(input.engine || "").trim() && !normalized.engine) {
+    errors.push({ field: "engine", message: "engine_invalido" });
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "language") && String(input.language || "").trim() && !normalized.language) {
+    errors.push({ field: "language", message: "language_invalido_formato_iso" });
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "region") && String(input.region || "").trim() && !normalized.region) {
+    errors.push({ field: "region", message: "region_invalida_formato_iso" });
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "variant") && String(input.variant || "").trim() && !normalized.variant) {
+    errors.push({ field: "variant", message: "variant_invalida" });
+  }
+
+  if (Object.prototype.hasOwnProperty.call(input, "stream")) {
+    const raw = String(input.stream || "").trim().toUpperCase();
+    if (raw && !TERMUX_STREAMS.has(raw)) {
+      errors.push({ field: "stream", message: "stream_invalido" });
+    }
+  }
+
+  validateEnumField(input.outputMode, OUTPUT_MODES, "outputMode", errors);
+  validateEnumField(input.coexistenceMode, COEXISTENCE_MODES, "coexistenceMode", errors);
+
+  if (!RUNTIME_CAPS.hasTermuxTts) {
+    warnings.push({
+      field: "runtime",
+      message: "termux-tts-speak no detectado; la configuracion quedara guardada pero no se podra ejecutar en este runtime."
+    });
+  }
+
+  let enginesDetected = [];
+  let probeError = "";
+
+  if (RUNTIME_CAPS.hasTermuxTtsEngines) {
+    const probe = await getInstalledTermuxEngines();
+    enginesDetected = Array.isArray(probe.voices) ? probe.voices : [];
+    probeError = probe.error ? String(probe.error) : "";
+
+    if (normalized.engine && enginesDetected.length > 0 && !enginesDetected.includes(normalized.engine)) {
+      warnings.push({
+        field: "engine",
+        message: `engine_no_detectado: ${normalized.engine}`
+      });
+    }
+
+    if (probeError) {
+      warnings.push({
+        field: "engine",
+        message: "no_fue_posible_validar_engines_con_termux-tts-engines"
+      });
+    }
+  } else {
+    warnings.push({
+      field: "engine",
+      message: "termux-tts-engines no disponible; validacion de soporte real limitada."
+    });
+  }
+
+  warnings.push({
+    field: "language",
+    message: "Termux no expone una API estable para verificar soporte language/region/variant por engine en tiempo real; se aplica validacion defensiva."
+  });
+
+  if (normalized.outputMode === "media" && normalized.stream !== "MUSIC") {
+    warnings.push({
+      field: "stream",
+      message: "outputMode=media prioriza stream MUSIC durante la reproduccion."
+    });
+  }
+
+  return {
+    ok: errors.length === 0,
+    normalized,
+    errors,
+    warnings,
+    capabilities: {
+      hasTermuxTts: RUNTIME_CAPS.hasTermuxTts,
+      hasTermuxTtsEngines: RUNTIME_CAPS.hasTermuxTtsEngines,
+      enginesDetected,
+      probeError
+    }
+  };
+}
+
+function getTermuxConfigSnapshot() {
+  const defaults = normalizeTermuxConfig(DEFAULT_SETTINGS.termux, DEFAULT_SETTINGS.termux);
+  const persisted = getPersistedTermuxConfig();
+  const session = normalizeTermuxConfig(sessionTermuxOverrides, persisted);
+  const effective = getResolvedTermuxSpeakConfig();
+
+  return {
+    defaults,
+    persisted,
+    session,
+    effective,
+    persistScope: Object.keys(sessionTermuxOverrides || {}).length > 0 ? "session" : "global"
+  };
+}
+
+function buildTermuxSpeakArgs(termuxOverrides = null) {
+  const cfg = getResolvedTermuxSpeakConfig(termuxOverrides);
+  const args = [];
+
+  if (cfg.engine) args.push("-e", cfg.engine);
+  if (cfg.language) args.push("-l", cfg.language);
+  if (cfg.region) args.push("-n", cfg.region);
+  if (cfg.variant) args.push("-v", cfg.variant);
+
+  args.push("-p", String(cfg.pitch));
+  args.push("-r", String(cfg.rate));
+  args.push("-s", cfg.effectiveStream);
+
+  return { args, cfg };
+}
+
+async function speakWithTermux(text, options = {}) {
+  if (!RUNTIME_CAPS.hasTermuxTts) {
+    throw new Error("termux_tts_missing");
+  }
+
+  const cleanText = validateTextForSpeech(text, MAX_TERMUX_TEXT_LEN);
+  if (!cleanText) return;
+
+  const { args } = buildTermuxSpeakArgs(options.termuxOverrides || null);
+  await runProcess("termux-tts-speak", args, `${cleanText}\n`, {
+    timeoutMs: TTS_CMD_TIMEOUT_MS,
+    onSpawn: options.onSpawn
+  });
+}
+async function speakWithPiper(text, options = {}) {
+  const ttsText = validateTextForSpeech(text, MAX_TERMUX_TEXT_LEN);
+  if (!ttsText) return;
+
+  const modelPath = normalizePiperModelPath(options?.modelPath || "");
   if (!modelPath) throw new Error("piper_model_missing");
+  if (!fs.existsSync(modelPath)) throw new Error(`piper_model_not_found: ${modelPath}`);
 
   const lengthScale = clampNumber(options?.lengthScale, 0.5, 2.5, 1.0);
   const volume = clampNumber(options?.volume, 0.0, 2.0, 1.0);
-  const pythonCmd = String(options?.pythonCmd || "py").trim() || "py";
+  const pythonCmd = String(options?.pythonCmd || DEFAULT_PIPER_PYTHON_CMD).trim() || DEFAULT_PIPER_PYTHON_CMD;
 
   const wavPath = path.join(
     os.tmpdir(),
@@ -540,61 +1129,170 @@ async function speakWithPiper(text, options) {
       "--volume",
       String(volume)
     ],
-    `${text}\n`
+    `${ttsText}\n`,
+    { timeoutMs: 120000, onSpawn: options.onSpawn }
   );
 
   try {
     if (process.platform === "win32") {
       const safePath = wavPath.replace(/'/g, "''");
       const psCmd = `(New-Object System.Media.SoundPlayer '${safePath}').PlaySync()`;
-      await runProcess("powershell", ["-NoProfile", "-Command", psCmd]);
+      await runProcess("powershell", ["-NoProfile", "-Command", psCmd], null, { timeoutMs: 120000, onSpawn: options.onSpawn });
     } else if (process.platform === "darwin") {
-      await runProcess("afplay", [wavPath]);
+      await runProcess("afplay", [wavPath], null, { timeoutMs: 120000, onSpawn: options.onSpawn });
+    } else if (RUNTIME_CAPS.hasAplay) {
+      await runProcess("aplay", ["-q", wavPath], null, { timeoutMs: 120000, onSpawn: options.onSpawn });
+    } else if (RUNTIME_CAPS.hasPaplay) {
+      await runProcess("paplay", [wavPath], null, { timeoutMs: 120000, onSpawn: options.onSpawn });
+    } else if (RUNTIME_CAPS.hasTermuxMediaPlayer) {
+      await runProcess("termux-media-player", ["play", wavPath], null, { timeoutMs: 8000, onSpawn: options.onSpawn });
+      await new Promise((r) => setTimeout(r, Math.min(10000, Math.max(1200, ttsText.length * 65))));
+      await runProcess("termux-media-player", ["stop"], null, { timeoutMs: 4000, onSpawn: options.onSpawn }).catch(() => {});
     } else {
-      // linux: intenta aplay; si no existe, caerá al catch de speakMessage
-      await runProcess("aplay", ["-q", wavPath]);
+      throw new Error("no_audio_player_for_piper");
     }
   } finally {
     await fs.promises.unlink(wavPath).catch(() => {});
   }
 }
+async function speakWithSay(text, options = {}) {
+  const say = await loadSayApi();
+  const voice = Object.prototype.hasOwnProperty.call(options, "voice")
+    ? options.voice
+    : (settings.ttsVoice || null);
+  const rate = clampNumber(
+    Object.prototype.hasOwnProperty.call(options, "rate") ? options.rate : settings.ttsRate,
+    MIN_TTS_RATE,
+    MAX_TTS_RATE,
+    1.0
+  );
+  const timeoutMs = Number(options.timeoutMs || TTS_CMD_TIMEOUT_MS);
 
-function speakWithSay(text) {
-  return new Promise((resolve, reject) => {
-    const voice = settings.ttsVoice || null;
-    const rate = clampNumber(settings.ttsRate, 0.5, 2.0, 1.0);
+  const speakPromise = new Promise((resolve, reject) => {
     try {
-      // say.speak(text, voice?, speed?, cb?)
       say.speak(text, voice, rate, (err) => {
-        if (err) return reject(err);
+        if (err) {
+          reject(err instanceof Error ? err : new Error(String(err)));
+          return;
+        }
         resolve();
       });
     } catch (err) {
-      reject(err);
+      reject(err instanceof Error ? err : new Error(String(err)));
     }
   });
+
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    await speakPromise;
+    return;
+  }
+
+  await Promise.race([
+    speakPromise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(`say timeout after ${timeoutMs}ms`)), timeoutMs);
+    })
+  ]);
 }
 
-async function speakMessage(text) {
-  const ttsText = normalizeForTts(text);
+function getEngineFallbackOrder(preferred) {
+  const seen = new Set();
+  const out = [];
+  const candidates = [preferred, getRecommendedEngine(), "termux", "piper", "say"];
+
+  for (const engine of candidates) {
+    if (!SUPPORTED_TTS_ENGINES.has(engine)) continue;
+    if (seen.has(engine)) continue;
+    seen.add(engine);
+    out.push(engine);
+  }
+
+  return out;
+}
+
+function isEngineRunnable(engine) {
+  if (engine === "termux") return RUNTIME_CAPS.hasTermuxTts;
+  if (engine === "say") return process.platform !== "android";
+  return true;
+}
+
+async function speakByEngine(engine, text, options = {}) {
+  if (engine === "termux") {
+    await speakWithTermux(text, {
+      termuxOverrides: options.termuxOverrides || null,
+      onSpawn: options.onSpawn
+    });
+    return;
+  }
+
+  if (engine === "piper") {
+    const piperOptions = options.piperOptions || settings.piper;
+    await speakWithPiper(text, piperOptions);
+    return;
+  }
+
+  await speakWithSay(text, options.sayOptions || {});
+}
+
+async function speakMessage(text, options = {}) {
+  const ttsText = validateTextForSpeech(text, MAX_TERMUX_TEXT_LEN);
   if (!ttsText) return;
 
-  if (settings.ttsEngine === "piper") {
+  const preferredCandidate = String(options.preferredEngine || settings.ttsEngine || "").trim();
+  const preferred = SUPPORTED_TTS_ENGINES.has(preferredCandidate)
+    ? preferredCandidate
+    : getRecommendedEngine();
+
+  const engines = options.strictEngine ? [preferred] : getEngineFallbackOrder(preferred);
+  const errors = [];
+
+  for (const engine of engines) {
+    if (!isEngineRunnable(engine)) {
+      errors.push(`${engine}:unavailable`);
+      continue;
+    }
+
     try {
-      await speakWithPiper(ttsText, settings.piper);
+      await speakByEngine(engine, ttsText, options);
+      if (engine !== preferred && !options.strictEngine) {
+        pushLog({ type: "tts_fallback", from: preferred, to: engine });
+      }
       return;
     } catch (err) {
-      pushLog({ type: "tts_error", error: String(err), engine: "piper" });
-      // fallback a say
+      const msg = getSafeError(err);
+      errors.push(`${engine}:${msg}`);
+      pushLog({ type: "tts_error", engine, error: msg });
     }
   }
 
-  await speakWithSay(ttsText);
+  throw new Error(`tts_all_engines_failed: ${errors.join(" | ")}`);
 }
 
-// Worker único (evita recursión y estados raros)
 let queueWorkerRunning = false;
+let speechLockDepth = 0;
+let directTtsInProgress = false;
 
+function isTtsBusy() {
+  return queueWorkerRunning || speechLockDepth > 0 || directTtsInProgress || queue.length > 0;
+}
+
+let speechSerial = Promise.resolve();
+function enqueueSpeechTask(task) {
+  const wrapped = async () => {
+    speechLockDepth += 1;
+    try {
+      return await task();
+    } finally {
+      speechLockDepth = Math.max(0, speechLockDepth - 1);
+    }
+  };
+
+  const run = speechSerial.then(wrapped, wrapped);
+  speechSerial = run.catch(() => {});
+  return run;
+}
+
+// Worker único
 async function queueWorkerLoop() {
   queueWorkerRunning = true;
   speaking = true;
@@ -607,15 +1305,17 @@ async function queueWorkerLoop() {
 
       if (!m) break;
 
-      pushLog({ type: "tts_speak", msg: m });
+      pushLog({ type: "tts_speak", id: m.id, source: m.source || "queue", uid: m.uniqueId });
 
       try {
-        await speakMessage(m.text);
+        await enqueueSpeechTask(() => speakMessage(m.text, {
+          termuxOverrides: m.termuxOverrides || null,
+          preferredEngine: m.ttsEngineOverride || null
+        }));
       } catch (err) {
-        pushLog({ type: "tts_error", error: String(err), msg: m });
+        pushLog({ type: "tts_error", error: getSafeError(err), id: m.id });
       }
 
-      // pequeña pausa para que no “trabe” UI/CPU
       await new Promise((r) => setTimeout(r, 120));
     }
   } finally {
@@ -630,7 +1330,7 @@ function startQueueWorker() {
   if (queueWorkerRunning) return;
   if (queue.length === 0) return;
   queueWorkerLoop().catch((err) => {
-    pushLog({ type: "worker_error", error: String(err) });
+    pushLog({ type: "worker_error", error: getSafeError(err) });
   });
 }
 
@@ -641,7 +1341,8 @@ function applySettingsUpdate(update) {
   const next = {
     ...settings,
     autoBan: { ...settings.autoBan },
-    piper: { ...settings.piper }
+    piper: { ...settings.piper },
+    termux: { ...settings.termux }
   };
 
   if ("globalCooldownMs" in update) next.globalCooldownMs = Math.max(0, toInt(update.globalCooldownMs, settings.globalCooldownMs));
@@ -653,17 +1354,24 @@ function applySettingsUpdate(update) {
   if ("historySize" in update) next.historySize = Math.max(5, toInt(update.historySize, settings.historySize ?? 25));
 
   if ("ttsEngine" in update) {
-    const v = String(update.ttsEngine ?? "").trim();
-    if (v === "say" || v === "piper") next.ttsEngine = v;
+    const v = String(update.ttsEngine || "").trim();
+    if (SUPPORTED_TTS_ENGINES.has(v)) next.ttsEngine = v;
   }
 
-  if ("ttsRate" in update) next.ttsRate = clampNumber(update.ttsRate, 0.5, 2.0, settings.ttsRate);
+  if ("ttsRate" in update) next.ttsRate = clampNumber(update.ttsRate, MIN_TTS_RATE, MAX_TTS_RATE, settings.ttsRate);
   if ("ttsVoice" in update) next.ttsVoice = String(update.ttsVoice ?? "").trim();
 
   if ("piperModelPath" in update) next.piper.modelPath = String(update.piperModelPath ?? "").trim();
   if ("piperLengthScale" in update) next.piper.lengthScale = clampNumber(update.piperLengthScale, 0.5, 2.5, next.piper.lengthScale);
   if ("piperVolume" in update) next.piper.volume = clampNumber(update.piperVolume, 0.0, 2.0, next.piper.volume);
-  if ("piperPythonCmd" in update) next.piper.pythonCmd = String(update.piperPythonCmd ?? "").trim() || "py";
+  if ("piperPythonCmd" in update) next.piper.pythonCmd = String(update.piperPythonCmd || "").trim() || DEFAULT_PIPER_PYTHON_CMD;
+
+  const termuxInput = extractTermuxConfigInput(update);
+  if (Object.keys(termuxInput).length > 0) {
+    next.termux = normalizeTermuxConfig(termuxInput, next.termux);
+  } else {
+    next.termux = normalizeTermuxConfig(next.termux, DEFAULT_SETTINGS.termux);
+  }
 
   if ("autoBanEnabled" in update) next.autoBan.enabled = !!update.autoBanEnabled;
   if ("autoBanStrikeThreshold" in update) next.autoBan.strikeThreshold = Math.max(1, toInt(update.autoBanStrikeThreshold, next.autoBan.strikeThreshold ?? 2));
@@ -672,7 +1380,6 @@ function applySettingsUpdate(update) {
   settings = next;
   writeJsonAtomicSync(SETTINGS_PATH, settings);
 
-  // Ajustes post-update
   while (queue.length > settings.maxQueue) {
     const removed = queue.pop();
     pushLog({ type: "queue_drop", reason: "queue_resize", msg: removed });
@@ -685,6 +1392,11 @@ function applySettingsUpdate(update) {
   safeEmit("queue", getQueueSnapshot());
   safeEmit("historyBulk", getHistorySnapshot());
   safeEmit("status", getStatusSnapshot());
+
+  if (settings.ttsEngine === "termux" && !RUNTIME_CAPS.hasTermuxTts) {
+    pushLog({ type: "config_warning", warning: "termux_tts_missing" });
+  }
+
   return { ok: true };
 }
 
@@ -733,7 +1445,6 @@ async function connectTikTok() {
 
   if (tiktokStatus.status === "connecting") return { ok: false, error: "already_connecting" };
 
-  // limpia conexión anterior si existía
   disconnectTikTok("reconnect");
 
   tiktokConn = new WebcastPushConnection(username);
@@ -744,7 +1455,6 @@ async function connectTikTok() {
     updateTikTokStatus({ status: "connected", live: true, roomId: state.roomId ?? null });
     pushLog({ type: "tiktok_connected", roomId: state.roomId });
 
-    // listeners
     tiktokConn.on(WebcastEvent.CHAT, (data) => {
       const uniqueId = data.uniqueId || "unknown";
       const nickname = data.nickname || uniqueId;
@@ -765,7 +1475,7 @@ async function connectTikTok() {
         return;
       }
 
-      if (!canSpeak(uniqueId)) {
+      if (!canSpeakNow(uniqueId)) {
         pushLog({ type: "blocked_cooldown", uniqueId, nickname, comment, reason: "cooldown" });
         pushHistory({ uniqueId, nickname, comment, status: "blocked", reason: "cooldown" });
         return;
@@ -781,8 +1491,12 @@ async function connectTikTok() {
       };
 
       const ok = enqueueMessage(msg);
-      if (ok) pushHistory({ uniqueId, nickname, comment, status: "queued", reason: "" });
-      else pushHistory({ uniqueId, nickname, comment, status: "dropped", reason: "queue_full" });
+      if (ok) {
+        markSpeak(uniqueId);
+        pushHistory({ uniqueId, nickname, comment, status: "queued", reason: "" });
+      } else {
+        pushHistory({ uniqueId, nickname, comment, status: "dropped", reason: "queue_full" });
+      }
     });
 
     tiktokConn.on("disconnected", () => {
@@ -800,7 +1514,58 @@ async function connectTikTok() {
   }
 }
 
+function persistGlobalSettings() {
+  settings.termux = normalizeTermuxConfig(settings.termux, DEFAULT_SETTINGS.termux);
+  writeJsonAtomicSync(SETTINGS_PATH, settings);
+}
+
+function applyTermuxConfig(normalizedConfig, persistScope = "global") {
+  const safeConfig = normalizeTermuxConfig(normalizedConfig, getPersistedTermuxConfig());
+
+  if (persistScope === "session") {
+    sessionTermuxOverrides = { ...safeConfig };
+  } else {
+    settings.termux = safeConfig;
+    sessionTermuxOverrides = {};
+    persistGlobalSettings();
+  }
+
+  safeEmit("settings", getSettingsSnapshot());
+  return getTermuxConfigSnapshot();
+}
+
+function describeTermuxAudioBehavior(termuxConfig) {
+  const cfg = normalizeTermuxConfig(termuxConfig, DEFAULT_SETTINGS.termux);
+  const effectiveStream = resolveTermuxStream(cfg);
+  const notes = [];
+
+  if (cfg.outputMode === "media") {
+    notes.push("Se prioriza stream MUSIC para salida multimedia (no depende del canal de notificaciones).");
+  }
+
+  if (cfg.coexistenceMode === "duck") {
+    notes.push("Sin capa nativa Android en este repo: se hace best-effort con stream de audio, no control total de AudioFocus.");
+  }
+
+  if (cfg.coexistenceMode === "pause") {
+    notes.push("Modo pause es declarativo en arquitectura Termux/Web; pausar otras apps requiere integracion nativa Android.");
+  }
+
+  if (!RUNTIME_CAPS.isTermux || !RUNTIME_CAPS.hasTermuxTts) {
+    notes.push("Runtime actual sin termux-tts-speak; configuracion aplicable pero no ejecutable aqui.");
+  }
+
+  return {
+    outputMode: cfg.outputMode,
+    coexistenceMode: cfg.coexistenceMode,
+    effectiveStream,
+    notes
+  };
+}
+
 // -------------------- API --------------------
+app.get("/api/runtime", (_, res) => res.json(getRuntimeSnapshot()));
+
 // bans
 app.get("/api/bans", (_, res) => res.json(getBansSnapshot()));
 app.post("/api/ban", (req, res) => {
@@ -810,6 +1575,7 @@ app.post("/api/ban", (req, res) => {
   banUser(uid, String(reason ?? "manual"), Number(minutes ?? 30));
   res.json({ ok: true });
 });
+
 app.post("/api/unban", (req, res) => {
   const uid = String(req.body?.uniqueId || "").trim().replace(/^@/, "");
   if (!uid) return res.status(400).json({ error: "uniqueId requerido" });
@@ -826,9 +1592,112 @@ app.post("/api/tts", (req, res) => {
   if (ttsEnabled) startQueueWorker();
   res.json({ ok: true, ttsEnabled });
 });
+
 app.get("/api/tts/voices", async (_, res) => {
   const result = await getInstalledVoices();
   res.json(result);
+});
+
+app.get("/api/tts/config", async (_, res) => {
+  const snapshot = getTermuxConfigSnapshot();
+  const validation = await validateTermuxConfig(snapshot.effective, { baseConfig: snapshot.persisted });
+
+  res.json({
+    ok: true,
+    ...snapshot,
+    validation,
+    runtime: getRuntimeSnapshot(),
+    audioBehavior: describeTermuxAudioBehavior(snapshot.effective)
+  });
+});
+
+app.post("/api/tts/config/validate", async (req, res) => {
+  const base = req.body?.baseConfig && typeof req.body.baseConfig === "object"
+    ? req.body.baseConfig
+    : getEffectiveTermuxConfig();
+
+  const result = await validateTermuxConfig(req.body || {}, { baseConfig: base });
+  res.json(result);
+});
+
+app.post("/api/tts/config", async (req, res) => {
+  const persistScope = getPersistScope(req.body?.persistScope);
+  const validation = await validateTermuxConfig(req.body || {}, { baseConfig: getEffectiveTermuxConfig() });
+
+  if (!validation.ok) {
+    return res.status(400).json({ ok: false, errors: validation.errors, warnings: validation.warnings });
+  }
+
+  const snapshot = applyTermuxConfig(validation.normalized, persistScope);
+
+  res.json({
+    ok: true,
+    persistScope,
+    ...snapshot,
+    validation,
+    audioBehavior: describeTermuxAudioBehavior(snapshot.effective)
+  });
+});
+
+app.post("/api/tts/test", async (req, res) => {
+  const text = validateTextForSpeech(req.body?.text, TTS_TEST_MAX_LEN);
+  const enqueueIfBusy = !!req.body?.enqueueIfBusy;
+
+  if (!text) {
+    return res.status(400).json({ ok: false, error: "text_requerido" });
+  }
+
+  const validation = await validateTermuxConfig(req.body || {}, { baseConfig: getEffectiveTermuxConfig() });
+  if (!validation.ok) {
+    return res.status(400).json({ ok: false, errors: validation.errors, warnings: validation.warnings });
+  }
+
+  if (isTtsBusy()) {
+    if (!enqueueIfBusy) {
+      return res.status(409).json({ ok: false, error: "tts_busy", queueSize: queue.length });
+    }
+
+    const queued = enqueueMessage({
+      id: nextMsgId++,
+      uniqueId: "local",
+      nickname: "tts-test",
+      text,
+      ts: nowMs(),
+      source: "local-test",
+      termuxOverrides: validation.normalized,
+      ttsEngineOverride: "termux"
+    });
+
+    if (!queued) {
+      return res.status(409).json({ ok: false, error: "queue_full" });
+    }
+
+    return res.json({ ok: true, queued: true, queueSize: queue.length });
+  }
+
+  directTtsInProgress = true;
+  safeEmit("status", getStatusSnapshot());
+
+  try {
+    await enqueueSpeechTask(() => speakMessage(text, {
+      preferredEngine: "termux",
+      strictEngine: true,
+      termuxOverrides: validation.normalized
+    }));
+
+    return res.json({
+      ok: true,
+      played: true,
+      effective: getResolvedTermuxSpeakConfig(validation.normalized),
+      warnings: validation.warnings,
+      audioBehavior: describeTermuxAudioBehavior(validation.normalized)
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: getSafeError(err), warnings: validation.warnings });
+  } finally {
+    directTtsInProgress = false;
+    safeEmit("status", getStatusSnapshot());
+  }
 });
 
 app.post("/api/queue/clear", (_, res) => {
@@ -836,6 +1705,7 @@ app.post("/api/queue/clear", (_, res) => {
   safeEmit("queue", getQueueSnapshot());
   res.json({ ok: true });
 });
+
 app.post("/api/queue/skip", (req, res) => {
   const id = Number(req.body?.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "id requerido" });
@@ -843,12 +1713,20 @@ app.post("/api/queue/skip", (req, res) => {
   if (!ok) return res.status(404).json({ error: "not_found" });
   res.json({ ok: true });
 });
+
 app.post("/api/queue/test", (req, res) => {
   const { uniqueId, nickname, text, count } = req.body ?? {};
   const rawText = typeof text === "string" ? text : "";
   const uid = typeof uniqueId === "string" && uniqueId.trim() ? uniqueId.trim().replace(/^@/, "") : "local";
   const name = typeof nickname === "string" && nickname.trim() ? nickname.trim() : uid;
   const repeat = Number.isFinite(Number(count)) ? Math.max(1, Math.min(50, Math.trunc(Number(count)))) : 1;
+
+  const requestedEngine = String(req.body?.ttsEngine || req.body?.ttsEngineOverride || "").trim();
+  const ttsEngineOverride = SUPPORTED_TTS_ENGINES.has(requestedEngine) ? requestedEngine : null;
+  const termuxInput = extractTermuxConfigInput(req.body || {});
+  const termuxOverrides = Object.keys(termuxInput).length > 0
+    ? normalizeTermuxConfig(termuxInput, getEffectiveTermuxConfig())
+    : null;
 
   const b = isBanned(uid);
   if (b.banned) {
@@ -867,7 +1745,17 @@ app.post("/api/queue/test", (req, res) => {
   let added = 0;
   let dropped = 0;
   for (let i = 0; i < repeat; i++) {
-    const msg = { id: nextMsgId++, uniqueId: uid, nickname: name, text: f.text, ts: nowMs(), source: "local" };
+    const msg = {
+      id: nextMsgId++,
+      uniqueId: uid,
+      nickname: name,
+      text: f.text,
+      ts: nowMs(),
+      source: "local",
+      termuxOverrides,
+      ttsEngineOverride
+    };
+
     const ok = enqueueMessage(msg);
     if (ok) {
       added++;
@@ -882,7 +1770,6 @@ app.post("/api/queue/test", (req, res) => {
   if (added === 0) return res.json({ ok: false, reason: "queue_full" });
   res.json({ ok: true, added, dropped });
 });
-
 // settings
 app.get("/api/settings", (_, res) => res.json(getSettingsSnapshot()));
 app.post("/api/settings", (req, res) => {
@@ -897,15 +1784,17 @@ app.post("/api/tiktok/connect", async (_, res) => {
   const result = await connectTikTok();
   res.json({ ...result, status: getTikTokStatusSnapshot() });
 });
+
 app.post("/api/tiktok/disconnect", (_, res) => {
   disconnectTikTok("manual");
   res.json({ ok: true, status: getTikTokStatusSnapshot() });
 });
 
-// lists (texto completo)
+// lists
 app.get("/api/lists", (_, res) => {
   res.json({ exact: readLines(BAD_EXACT_PATH), sub: readLines(BAD_SUB_PATH) });
 });
+
 app.post("/api/lists", (req, res) => {
   const { exact, sub } = req.body ?? {};
   if (typeof exact === "string") fs.writeFileSync(BAD_EXACT_PATH, exact.replace(/\r/g, ""), "utf8");
@@ -950,12 +1839,15 @@ io.on("connection", (socket) => {
   socket.emit("listsUpdated", getListsSnapshot());
   socket.emit("settings", getSettingsSnapshot());
   socket.emit("tiktokStatus", getTikTokStatusSnapshot());
+  socket.emit("runtime", getRuntimeSnapshot());
   socket.emit("logBulk", recentLog);
 });
 
 // -------------------- Start --------------------
 httpServer.listen(settings.port, settings.bindHost, () => {
+  const runtime = getRuntimeSnapshot();
   console.log(`Dashboard: http://${settings.bindHost}:${settings.port}`);
+  console.log(`Runtime: platform=${runtime.platform} termux=${runtime.isTermux} engines=${runtime.availableTtsEngines.join(",")} recommended=${runtime.recommendedTtsEngine}`);
 });
 
 // Cierre limpio
@@ -963,6 +1855,7 @@ process.on("SIGINT", () => {
   try { disconnectTikTok("SIGINT"); } catch {}
   process.exit(0);
 });
+
 process.on("SIGTERM", () => {
   try { disconnectTikTok("SIGTERM"); } catch {}
   process.exit(0);

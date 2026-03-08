@@ -113,6 +113,22 @@ const optPiperLengthScale = qs("optPiperLengthScale");
 const optPiperVolume = qs("optPiperVolume");
 const optPiperPythonCmd = qs("optPiperPythonCmd");
 
+const optTermuxEngine = qs("optTermuxEngine");
+const optTermuxLanguage = qs("optTermuxLanguage");
+const optTermuxRegion = qs("optTermuxRegion");
+const optTermuxVariant = qs("optTermuxVariant");
+const optTermuxStream = qs("optTermuxStream");
+const optTermuxPitch = qs("optTermuxPitch");
+const optTermuxRate = qs("optTermuxRate");
+const optTermuxOutputMode = qs("optTermuxOutputMode");
+const optTermuxCoexistenceMode = qs("optTermuxCoexistenceMode");
+const optTermuxPersistScope = qs("optTermuxPersistScope");
+const optTermuxTestText = qs("optTermuxTestText");
+const optTermuxTestBtn = qs("optTermuxTestBtn");
+const optTermuxRestore = qs("optTermuxRestore");
+const optTermuxValidation = qs("optTermuxValidation");
+const optTermuxAudioNote = qs("optTermuxAudioNote");
+
 const refreshVoices = qs("refreshVoices");
 const voicesStatus = qs("voicesStatus");
 
@@ -123,6 +139,7 @@ const optAutoBanMinutes = qs("optAutoBanMinutes");
 const saveSettings = qs("saveSettings");
 const reloadSettings = qs("reloadSettings");
 const settingsStatus = qs("settingsStatus");
+const runtimeStatus = qs("runtimeStatus");
 
 const testUser = qs("testUser");
 const testText = qs("testText");
@@ -184,6 +201,9 @@ let ttsEnabled = true;
 let historyItems = [];
 let historyMax = 25;
 let pendingVoice = "";
+let ttsConfigDefaults = null;
+let ttsConfigEffective = null;
+let termuxValidateDebounceTimer = null;
 
 // -------------------- UI setters --------------------
 function applyTheme(mode) {
@@ -252,10 +272,136 @@ function setVoicesStatus(message, variant) {
   voicesStatus.textContent = message;
 }
 
+function setTermuxValidation(message, variant = "info") {
+  if (!optTermuxValidation) return;
+  const styles = {
+    ok: "text-emerald-600 dark:text-emerald-400",
+    error: "text-rose-600 dark:text-rose-400",
+    info: "text-slate-500 dark:text-slate-400"
+  };
+  optTermuxValidation.className = `mt-2 text-xs ${styles[variant] || styles.info}`;
+  optTermuxValidation.textContent = message;
+}
+
+function setTermuxAudioNote(message) {
+  if (!optTermuxAudioNote) return;
+  optTermuxAudioNote.textContent = message || "";
+}
+
+function getTermuxFormPayload() {
+  return {
+    engine: optTermuxEngine?.value?.trim() || "",
+    language: optTermuxLanguage?.value?.trim() || "",
+    region: optTermuxRegion?.value?.trim() || "",
+    variant: optTermuxVariant?.value?.trim() || "",
+    stream: optTermuxStream?.value || "MUSIC",
+    pitch: Number(optTermuxPitch?.value || 1),
+    rate: Number(optTermuxRate?.value || 1),
+    outputMode: optTermuxOutputMode?.value || "media",
+    coexistenceMode: optTermuxCoexistenceMode?.value || "duck"
+  };
+}
+
+function applyTermuxForm(config, scope = null) {
+  if (!config || typeof config !== "object") return;
+
+  if (optTermuxEngine) optTermuxEngine.value = config.engine || "";
+  if (optTermuxLanguage) optTermuxLanguage.value = config.language || "";
+  if (optTermuxRegion) optTermuxRegion.value = config.region || "";
+  if (optTermuxVariant) optTermuxVariant.value = config.variant || "";
+  if (optTermuxStream) optTermuxStream.value = config.stream || "MUSIC";
+  if (optTermuxPitch) optTermuxPitch.value = String(config.pitch ?? 1);
+  if (optTermuxRate) optTermuxRate.value = String(config.rate ?? 1);
+  if (optTermuxOutputMode) optTermuxOutputMode.value = config.outputMode || "media";
+  if (optTermuxCoexistenceMode) optTermuxCoexistenceMode.value = config.coexistenceMode || "duck";
+  if (scope && optTermuxPersistScope) optTermuxPersistScope.value = scope;
+
+  ttsConfigEffective = { ...config };
+}
+
+function renderTermuxValidationResult(result) {
+  if (!result) return;
+
+  const errors = Array.isArray(result.errors) ? result.errors : [];
+  const warnings = Array.isArray(result.warnings) ? result.warnings : [];
+
+  if (errors.length > 0) {
+    const first = errors[0];
+    setTermuxValidation(`Error ${first.field || "config"}: ${first.message || "inválido"}`, "error");
+    return;
+  }
+
+  if (warnings.length > 0) {
+    const first = warnings[0];
+    setTermuxValidation(`Aviso ${first.field || "config"}: ${first.message || "revisa soporte"}`, "info");
+  } else {
+    setTermuxValidation("Configuración válida.", "ok");
+  }
+}
+
+async function validateTermuxForm() {
+  const payload = getTermuxFormPayload();
+  try {
+    const result = await apiFetch("/api/tts/config/validate", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    renderTermuxValidationResult(result);
+    return result;
+  } catch {
+    setTermuxValidation("No se pudo validar con backend.", "error");
+    return null;
+  }
+}
+
+function scheduleTermuxValidation() {
+  if (termuxValidateDebounceTimer) clearTimeout(termuxValidateDebounceTimer);
+  termuxValidateDebounceTimer = setTimeout(() => {
+    void validateTermuxForm();
+  }, 280);
+}
+
+async function loadTtsConfig() {
+  try {
+    const j = await apiFetch("/api/tts/config", { method: "GET", headers: {} });
+    ttsConfigDefaults = j?.defaults || null;
+
+    if (j?.effective) {
+      applyTermuxForm(j.effective, j.persistScope || "global");
+    }
+
+    if (j?.audioBehavior?.effectiveStream) {
+      const notes = Array.isArray(j.audioBehavior.notes) ? j.audioBehavior.notes : [];
+      const info = `Stream efectivo: ${j.audioBehavior.effectiveStream}${notes.length ? ` | ${notes[0]}` : ""}`;
+      setTermuxAudioNote(info);
+    }
+
+    renderTermuxValidationResult(j?.validation);
+  } catch {
+    setTermuxValidation("Error cargando configuración TTS de Termux.", "error");
+  }
+}
+
+function renderRuntime(runtime) {
+  if (!runtimeStatus || !runtime) return;
+
+  const engines = Array.isArray(runtime.availableTtsEngines)
+    ? runtime.availableTtsEngines.join(", ")
+    : "-";
+
+  runtimeStatus.textContent = `Runtime: ${runtime.platform}${runtime.isTermux ? " (Termux)" : ""} | Motores: ${engines} | Recomendado: ${runtime.recommendedTtsEngine || "-"}`;
+}
+
 function setTtsEngineState(engine) {
   const usePiper = engine === "piper";
+  const useTermux = engine === "termux";
+
   piperSettings?.classList.toggle("hidden", !usePiper);
-  saySettings?.classList.toggle("hidden", usePiper);
+  saySettings?.classList.toggle("hidden", usePiper || useTermux);
+
+  if (useTermux) {
+    setVoicesStatus("Termux API activo.", "info");
+  }
 }
 
 function formatHistoryTime(ts) {
@@ -454,6 +600,23 @@ function applySettingsToForm(s) {
   pendingVoice = s.ttsVoice ?? "";
   if (optTtsVoice) optTtsVoice.value = pendingVoice;
 
+  applyTermuxForm({
+    engine: s.termuxEngine ?? "",
+    language: s.termuxLanguage ?? "",
+    region: s.termuxRegion ?? "",
+    variant: s.termuxVariant ?? "",
+    stream: s.termuxStream ?? "MUSIC",
+    pitch: s.termuxPitch ?? 1,
+    rate: s.termuxRate ?? 1,
+    outputMode: s.termuxOutputMode ?? "media",
+    coexistenceMode: s.termuxCoexistenceMode ?? "duck"
+  }, s.termuxPersistScope || "global");
+
+  if (s.termuxEffectiveStream) {
+    setTermuxAudioNote(`Stream efectivo: ${s.termuxEffectiveStream}`);
+  }
+
+  renderRuntime(s.runtime);
   renderHistoryDebounced();
 }
 
@@ -631,6 +794,8 @@ socket.on("listsUpdated", () => {
 
 socket.on("settings", (s) => applySettingsToForm(s));
 
+socket.on("runtime", (runtime) => renderRuntime(runtime));
+
 socket.on("tiktokStatus", (s) => renderTikTokStatus(s));
 
 socket.on("logBulk", (items) => {
@@ -659,8 +824,83 @@ on(window, "keydown", (event) => {
   if (event.key === "Escape") setOptionsOpen(false);
 });
 
-on(optTtsEngine, "change", () => setTtsEngineState(optTtsEngine.value));
+on(optTtsEngine, "change", () => {
+  setTtsEngineState(optTtsEngine.value);
+  void loadVoices();
+});
 
+
+[
+  optTermuxEngine,
+  optTermuxLanguage,
+  optTermuxRegion,
+  optTermuxVariant,
+  optTermuxStream,
+  optTermuxPitch,
+  optTermuxRate,
+  optTermuxOutputMode,
+  optTermuxCoexistenceMode
+].forEach((el) => {
+  on(el, "input", scheduleTermuxValidation);
+  on(el, "change", scheduleTermuxValidation);
+});
+
+on(optTermuxRestore, "click", () => {
+  const defaults = ttsConfigDefaults || {
+    engine: "",
+    language: "",
+    region: "",
+    variant: "",
+    stream: "MUSIC",
+    pitch: 1,
+    rate: 1,
+    outputMode: "media",
+    coexistenceMode: "duck"
+  };
+
+  applyTermuxForm(defaults, optTermuxPersistScope?.value || "global");
+  setTermuxValidation("Restaurado a valores por defecto (pendiente de guardar).", "info");
+  scheduleTermuxValidation();
+});
+
+on(optTermuxTestBtn, "click", async () => {
+  const testPhrase = (optTermuxTestText?.value || "").trim();
+  if (!testPhrase) {
+    setTermuxValidation("Ingresa un texto corto para probar voz.", "error");
+    return;
+  }
+
+  const validation = await validateTermuxForm();
+  if (!validation?.ok) return;
+
+  setTermuxValidation("Probando voz...", "info");
+  try {
+    const payload = {
+      ...getTermuxFormPayload(),
+      text: testPhrase,
+      enqueueIfBusy: true
+    };
+
+    const j = await apiFetch("/api/tts/test", {
+      method: "POST",
+      body: JSON.stringify(payload),
+      timeoutMs: 20000
+    });
+
+    if (j?.queued) {
+      setTermuxValidation("TTS ocupado: prueba encolada.", "info");
+    } else {
+      setTermuxValidation("Prueba de voz enviada correctamente.", "ok");
+    }
+
+    if (j?.audioBehavior?.effectiveStream) {
+      const notes = Array.isArray(j.audioBehavior.notes) ? j.audioBehavior.notes : [];
+      setTermuxAudioNote(`Stream efectivo: ${j.audioBehavior.effectiveStream}${notes.length ? ` | ${notes[0]}` : ""}`);
+    }
+  } catch (e) {
+    setTermuxValidation(`Error en prueba: ${String(e.message || e)}`, "error");
+  }
+});
 on(ttsToggle, "click", async () => {
   try {
     await apiFetch("/api/tts", {
@@ -768,6 +1008,8 @@ async function loadSettings() {
   try {
     const j = await apiFetch("/api/settings", { method: "GET", headers: {} });
     applySettingsToForm(j);
+    await loadTtsConfig();
+    void loadVoices();
   } catch (e) {
     setSettingsStatus("Error cargando opciones.", "error");
   }
@@ -775,6 +1017,24 @@ async function loadSettings() {
 
 async function loadVoices() {
   if (!optTtsVoice) return;
+
+  const selectedEngine = optTtsEngine?.value || "say";
+
+  if (selectedEngine === "termux") {
+    setVoicesStatus("Consultando motores Termux...", "info");
+    try {
+      const j = await apiFetch("/api/tts/voices", { method: "GET", headers: {} });
+      const engines = Array.isArray(j?.voices) ? j.voices : [];
+      const count = engines.length;
+
+      if (count > 0) setVoicesStatus(`Motores termux: ${count}`, "ok");
+      else if (j?.error) setVoicesStatus(`Termux: ${j.error}`, "error");
+      else setVoicesStatus("Sin motores termux detectados.", "error");
+    } catch (e) {
+      setVoicesStatus("Error consultando termux.", "error");
+    }
+    return;
+  }
 
   setVoicesStatus("Cargando voces...", "info");
   try {
@@ -839,7 +1099,7 @@ on(saveSettings, "click", async () => {
 
   if (optTtsEngine) {
     const engine = optTtsEngine.value;
-    if (engine !== "say" && engine !== "piper") {
+    if (engine !== "say" && engine !== "piper" && engine !== "termux") {
       setSettingsStatus("Valor inválido: ttsEngine", "error");
       return;
     }
@@ -878,21 +1138,47 @@ on(saveSettings, "click", async () => {
 
   if (optPiperPythonCmd) payload.piperPythonCmd = optPiperPythonCmd.value || "py";
 
-  setSettingsStatus("Guardando...", "info");
+  const termuxPayload = getTermuxFormPayload();
+  const persistScope = optTermuxPersistScope?.value || "global";
+
+  setSettingsStatus("Validando configuración Termux...", "info");
+
+  const termuxValidation = await validateTermuxForm();
+  if (!termuxValidation?.ok) {
+    setSettingsStatus("Corrige la configuración Termux antes de guardar.", "error");
+    return;
+  }
+
+  setSettingsStatus("Guardando opciones...", "info");
   try {
-    const j = await apiFetch("/api/settings", {
+    const settingsRes = await apiFetch("/api/settings", {
       method: "POST",
       body: JSON.stringify(payload)
     });
 
-    if (j?.ok) {
-      applySettingsToForm(j.settings);
-      setSettingsStatus("Opciones guardadas.", "ok");
-    } else {
-      setSettingsStatus("No se pudo guardar.", "error");
+    const termuxRes = await apiFetch("/api/tts/config", {
+      method: "POST",
+      body: JSON.stringify({ ...termuxPayload, persistScope })
+    });
+
+    if (settingsRes?.ok) {
+      applySettingsToForm(settingsRes.settings);
     }
+
+    if (termuxRes?.effective) {
+      applyTermuxForm(termuxRes.effective, termuxRes.persistScope || persistScope);
+    }
+
+    renderTermuxValidationResult(termuxRes?.validation || termuxValidation);
+
+    if (termuxRes?.audioBehavior?.effectiveStream) {
+      const notes = Array.isArray(termuxRes.audioBehavior.notes) ? termuxRes.audioBehavior.notes : [];
+      setTermuxAudioNote(`Stream efectivo: ${termuxRes.audioBehavior.effectiveStream}${notes.length ? ` | ${notes[0]}` : ""}`);
+    }
+
+    setSettingsStatus("Opciones guardadas.", "ok");
   } catch (e) {
-    setSettingsStatus("Error guardando opciones.", "error");
+    setSettingsStatus(`Error guardando opciones: ${String(e.message || e)}`, "error");
   }
 });
 
@@ -909,5 +1195,4 @@ on(refreshVoices, "click", async () => {
 // -------------------- init --------------------
 loadLists();
 loadSettings();
-loadVoices();
 loadTikTokStatus();
