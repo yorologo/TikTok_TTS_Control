@@ -143,7 +143,15 @@ dist
 
 # End of https://www.toptal.com/developers/gitignore/api/node
 
-data/settings.json
 .vscode/
 .venv/
 data/piper/
+
+# Local app state and generated runtime artifacts
+data/settings.json
+data/banned_users.json
+data/runtime/
+data/**/*.wav
+data/**/*.tmp
+data/**/*.temp
+data/**/*.log

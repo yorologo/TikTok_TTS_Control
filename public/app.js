@@ -1,7 +1,35 @@
 /* global io */
 "use strict";
 
-const socket = io();
+const ADMIN_TOKEN_STORAGE_KEY = "adminToken";
+
+function normalizeAdminTokenInput(value) {
+  return String(value ?? "").trim().replace(/[\r\n\t]+/g, "").slice(0, 256);
+}
+
+function getClientAdminToken() {
+  try {
+    return normalizeAdminTokenInput(localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || "");
+  } catch {
+    return "";
+  }
+}
+
+function setClientAdminToken(token) {
+  const normalized = normalizeAdminTokenInput(token);
+  try {
+    if (normalized) localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, normalized);
+    else localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  } catch {}
+  return normalized;
+}
+
+const socket = io({
+  autoConnect: false,
+  auth: { adminToken: getClientAdminToken() }
+});
+
+let reportAuthFailure = () => {};
 
 // -------------------- DOM helpers --------------------
 const qs = (id) => document.getElementById(id);
@@ -35,6 +63,7 @@ async function apiFetch(url, options = {}) {
       ...options,
       headers: {
         "Content-Type": "application/json",
+        ...(getClientAdminToken() ? { "x-admin-token": getClientAdminToken() } : {}),
         ...(options.headers || {})
       },
       signal: controller.signal
@@ -49,7 +78,10 @@ async function apiFetch(url, options = {}) {
     }
 
     if (!res.ok) {
-      const msg = json?.error || json?.message || `HTTP ${res.status}`;
+      const msg = json?.message || json?.error || `HTTP ${res.status}`;
+      if (res.status === 401 || res.status === 403) {
+        reportAuthFailure(msg, json?.error || "admin_auth_failed", res.status);
+      }
       const err = new Error(msg);
       err.status = res.status;
       err.body = json;
@@ -93,6 +125,14 @@ const banUser = qs("banUser");
 const banMinutes = qs("banMinutes");
 const banReason = qs("banReason");
 const banBtn = qs("banBtn");
+
+const optTikTokUsername = qs("optTikTokUsername");
+const optBindHost = qs("optBindHost");
+const optPort = qs("optPort");
+const optAdminToken = qs("optAdminToken");
+const saveAdminTokenLocal = qs("saveAdminTokenLocal");
+const clearAdminTokenLocal = qs("clearAdminTokenLocal");
+const authStatus = qs("authStatus");
 
 const optGlobalCooldown = qs("optGlobalCooldown");
 const optUserCooldown = qs("optUserCooldown");
@@ -140,6 +180,7 @@ const saveSettings = qs("saveSettings");
 const reloadSettings = qs("reloadSettings");
 const settingsStatus = qs("settingsStatus");
 const runtimeStatus = qs("runtimeStatus");
+const runtimeRestartNotice = qs("runtimeRestartNotice");
 
 const testUser = qs("testUser");
 const testText = qs("testText");
@@ -151,6 +192,7 @@ const testStatus = qs("testStatus");
 const THEME_KEY = "theme";
 const OPTIONS_KEY = "optionsOpen";
 const PUSH_CLASSES = ["lg:-translate-x-48", "xl:-translate-x-64"];
+const RUNTIME_BIND_HOSTS = ["127.0.0.1", "0.0.0.0", "localhost"];
 
 const LIVE_PILL_BASE = "inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold shadow-sm transition";
 const LIVE_STYLES = {
@@ -176,7 +218,22 @@ const SETTINGS_STATUS_BASE = "text-xs";
 const SETTINGS_STATUS_STYLES = {
   ok: "text-emerald-600 dark:text-emerald-400",
   error: "text-rose-600 dark:text-rose-400",
-  info: "text-slate-500 dark:text-slate-400"
+  info: "text-slate-500 dark:text-slate-400",
+  warn: "text-amber-600 dark:text-amber-400"
+};
+
+const AUTH_STATUS_BASE = "text-xs";
+const AUTH_STATUS_STYLES = {
+  ok: "text-emerald-600 dark:text-emerald-400",
+  error: "text-rose-600 dark:text-rose-400",
+  info: "text-slate-500 dark:text-slate-400",
+  warn: "text-amber-600 dark:text-amber-400"
+};
+
+const RESTART_NOTICE_BASE = "text-xs";
+const RESTART_NOTICE_STYLES = {
+  info: "text-slate-500 dark:text-slate-400",
+  warn: "text-amber-600 dark:text-amber-400"
 };
 
 const VOICE_STATUS_BASE = "text-xs";
@@ -204,6 +261,7 @@ let pendingVoice = "";
 let ttsConfigDefaults = null;
 let ttsConfigEffective = null;
 let termuxValidateDebounceTimer = null;
+let latestSettingsSnapshot = null;
 
 // -------------------- UI setters --------------------
 function applyTheme(mode) {
@@ -265,6 +323,77 @@ function setSettingsStatus(message, variant) {
   settingsStatus.textContent = message;
 }
 
+function setRuntimeRestartNotice(message, variant = "info") {
+  if (!runtimeRestartNotice) return;
+  const style = RESTART_NOTICE_STYLES[variant] || RESTART_NOTICE_STYLES.info;
+  runtimeRestartNotice.className = `${RESTART_NOTICE_BASE} ${style}`;
+  runtimeRestartNotice.textContent = message || "";
+}
+
+function setAuthStatus(message, variant = "info") {
+  if (!authStatus) return;
+  const style = AUTH_STATUS_STYLES[variant] || AUTH_STATUS_STYLES.info;
+  authStatus.className = `${AUTH_STATUS_BASE} ${style}`;
+  authStatus.textContent = message || "";
+}
+
+function syncSocketAuth(reconnect = false) {
+  socket.auth = { adminToken: getClientAdminToken() };
+  if (!reconnect) return;
+  if (socket.connected) socket.disconnect();
+  socket.connect();
+}
+
+function refreshAuthStatus(snapshot = latestSettingsSnapshot) {
+  const storedToken = getClientAdminToken();
+  const serverConfigured = !!snapshot?.adminTokenConfigured;
+  const authRequired = !!snapshot?.adminAuthRequired;
+  const pendingExposedBind = !!snapshot?.bindHost && !["127.0.0.1", "localhost"].includes(String(snapshot.bindHost).trim().toLowerCase());
+
+  if (!authRequired) {
+    if (pendingExposedBind && !serverConfigured) {
+      setAuthStatus("Antes de reiniciar con bind público, configura un admin token en el servidor.", "warn");
+    } else if (pendingExposedBind && serverConfigured && !storedToken) {
+      setAuthStatus("Antes de reiniciar con bind público, guarda también el token local en este navegador.", "warn");
+    } else if (serverConfigured && storedToken) {
+      setAuthStatus("Modo loopback: token opcional. Hay token local y token configurado en servidor.", "info");
+    } else if (serverConfigured) {
+      setAuthStatus("Modo loopback: token opcional. El servidor ya tiene admin token configurado.", "info");
+    } else if (storedToken) {
+      setAuthStatus("Modo loopback: token opcional. Hay token local guardado en este navegador.", "info");
+    } else {
+      setAuthStatus("Modo loopback: no se requiere token administrativo.", "info");
+    }
+    return;
+  }
+
+  if (!serverConfigured) {
+    setAuthStatus("Protección admin activa, pero el servidor no tiene token configurado. Configúralo en loopback antes de exponer la interfaz.", "warn");
+    return;
+  }
+
+  if (storedToken) {
+    setAuthStatus("Protección admin activa. El navegador enviará el token guardado en x-admin-token.", "ok");
+  } else {
+    setAuthStatus("Protección admin activa. Guarda un token local para administrar esta interfaz.", "warn");
+  }
+}
+
+function persistLocalAdminToken(token, options = {}) {
+  const normalized = setClientAdminToken(token);
+  if (optAdminToken && (!optAdminToken.value || options.syncInput)) {
+    optAdminToken.value = normalized;
+  }
+  syncSocketAuth(options.reconnect !== false);
+  refreshAuthStatus();
+  return normalized;
+}
+
+reportAuthFailure = (message, errorCode) => {
+  const detail = errorCode ? `${errorCode}: ${message}` : message;
+  setAuthStatus(`Auth: ${detail}`, "error");
+};
+
 function setVoicesStatus(message, variant) {
   if (!voicesStatus) return;
   const style = VOICE_STATUS_STYLES[variant] || VOICE_STATUS_STYLES.info;
@@ -286,6 +415,10 @@ function setTermuxValidation(message, variant = "info") {
 function setTermuxAudioNote(message) {
   if (!optTermuxAudioNote) return;
   optTermuxAudioNote.textContent = message || "";
+}
+
+function normalizeTikTokUsernameInput(value) {
+  return String(value ?? "").trim().replace(/@+/g, "").replace(/\s+/g, "");
 }
 
 function getTermuxFormPayload() {
@@ -339,6 +472,15 @@ function renderTermuxValidationResult(result) {
   }
 }
 
+function formatValidationErrors(errors, maxItems = 3) {
+  const items = Array.isArray(errors) ? errors.filter(Boolean) : [];
+  if (items.length === 0) return "";
+  return items
+    .slice(0, maxItems)
+    .map((item) => `${item.field || "config"}: ${item.message || "inválido"}`)
+    .join(" | ");
+}
+
 async function validateTermuxForm() {
   const payload = getTermuxFormPayload();
   try {
@@ -389,7 +531,13 @@ function renderRuntime(runtime) {
     ? runtime.availableTtsEngines.join(", ")
     : "-";
 
-  runtimeStatus.textContent = `Runtime: ${runtime.platform}${runtime.isTermux ? " (Termux)" : ""} | Motores: ${engines} | Recomendado: ${runtime.recommendedTtsEngine || "-"}`;
+  const activeBindHost = latestSettingsSnapshot?.activeBindHost;
+  const activePort = latestSettingsSnapshot?.activePort;
+  const bindingText = activeBindHost && Number.isFinite(Number(activePort))
+    ? ` | Bind activo: ${activeBindHost}:${activePort}`
+    : "";
+
+  runtimeStatus.textContent = `Runtime: ${runtime.platform}${runtime.isTermux ? " (Termux)" : ""} | Motores: ${engines} | Recomendado: ${runtime.recommendedTtsEngine || "-"}${bindingText}`;
 }
 
 function setTtsEngineState(engine) {
@@ -575,6 +723,16 @@ function populateVoices(voices) {
 function applySettingsToForm(s) {
   if (!s) return;
 
+  latestSettingsSnapshot = s;
+
+  if (optAdminToken && !optAdminToken.value) {
+    const storedToken = getClientAdminToken();
+    if (storedToken) optAdminToken.value = storedToken;
+  }
+  if (optTikTokUsername) optTikTokUsername.value = s.tiktokUsername ?? "";
+  if (optBindHost) optBindHost.value = s.bindHost || "127.0.0.1";
+  if (optPort) optPort.value = s.port ?? "";
+
   if (optGlobalCooldown) optGlobalCooldown.value = s.globalCooldownMs ?? "";
   if (optUserCooldown) optUserCooldown.value = s.perUserCooldownMs ?? "";
   if (optMaxQueue) optMaxQueue.value = s.maxQueue ?? "";
@@ -617,6 +775,22 @@ function applySettingsToForm(s) {
   }
 
   renderRuntime(s.runtime);
+
+  const activeBindHost = s.activeBindHost || s.bindHost || "127.0.0.1";
+  const activePort = Number.isFinite(Number(s.activePort)) ? Number(s.activePort) : (s.port ?? "");
+  if (s.restartRequired) {
+    const fields = Array.isArray(s.restartFields) && s.restartFields.length > 0
+      ? s.restartFields.join(", ")
+      : "bindHost, port";
+    setRuntimeRestartNotice(
+      `Reinicio requerido: el servidor sigue usando ${activeBindHost}:${activePort}. Cambios pendientes en ${fields}: ${s.bindHost}:${s.port}.`,
+      "warn"
+    );
+  } else {
+    setRuntimeRestartNotice(`Servidor activo en ${activeBindHost}:${activePort}.`, "info");
+  }
+
+  refreshAuthStatus(s);
   renderHistoryDebounced();
 }
 
@@ -805,6 +979,14 @@ socket.on("logBulk", (items) => {
 });
 
 socket.on("log", (evt) => addLogLine(evt));
+socket.on("connect", () => {
+  refreshAuthStatus();
+});
+socket.on("connect_error", (err) => {
+  const message = err?.data?.message || err?.message || "No se pudo autenticar el socket.";
+  const code = err?.data?.error || "socket_auth_failed";
+  setAuthStatus(`Auth: ${code}: ${message}`, "error");
+});
 
 // -------------------- Buttons / Inputs --------------------
 on(darkToggle, "click", () => {
@@ -1011,7 +1193,11 @@ async function loadSettings() {
     await loadTtsConfig();
     void loadVoices();
   } catch (e) {
-    setSettingsStatus("Error cargando opciones.", "error");
+    if (e?.status === 401 || e?.status === 403) {
+      setSettingsStatus("Acceso administrativo requerido para cargar opciones.", "warn");
+    } else {
+      setSettingsStatus("Error cargando opciones.", "error");
+    }
   }
 }
 
@@ -1085,6 +1271,38 @@ on(saveSettings, "click", async () => {
 
   const payload = {};
 
+  if (optTikTokUsername) {
+    const tiktokUsername = normalizeTikTokUsernameInput(optTikTokUsername.value || "");
+    if (tiktokUsername && !/^[A-Za-z0-9._-]{2,64}$/.test(tiktokUsername)) {
+      setSettingsStatus("Valor inválido: tiktokUsername", "error");
+      return;
+    }
+    payload.tiktokUsername = tiktokUsername;
+    optTikTokUsername.value = tiktokUsername;
+  }
+
+  if (optBindHost) {
+    const bindHost = String(optBindHost.value || "").trim().toLowerCase();
+    if (!RUNTIME_BIND_HOSTS.includes(bindHost)) {
+      setSettingsStatus("Valor inválido: bindHost", "error");
+      return;
+    }
+    payload.bindHost = bindHost;
+  }
+
+  if (optPort) {
+    const port = Number(optPort.value);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      setSettingsStatus("Valor inválido: port", "error");
+      return;
+    }
+    payload.port = port;
+  }
+
+  const nextAdminToken = normalizeAdminTokenInput(optAdminToken?.value || "");
+  if (optAdminToken) optAdminToken.value = nextAdminToken;
+  if (nextAdminToken) payload.adminToken = nextAdminToken;
+
   for (const field of fields) {
     if (!field.el) continue;
     const value = Number(field.el.value);
@@ -1140,14 +1358,8 @@ on(saveSettings, "click", async () => {
 
   const termuxPayload = getTermuxFormPayload();
   const persistScope = optTermuxPersistScope?.value || "global";
-
-  setSettingsStatus("Validando configuración Termux...", "info");
-
-  const termuxValidation = await validateTermuxForm();
-  if (!termuxValidation?.ok) {
-    setSettingsStatus("Corrige la configuración Termux antes de guardar.", "error");
-    return;
-  }
+  payload.termuxPersistScope = persistScope;
+  Object.assign(payload, termuxPayload);
 
   setSettingsStatus("Guardando opciones...", "info");
   try {
@@ -1156,30 +1368,61 @@ on(saveSettings, "click", async () => {
       body: JSON.stringify(payload)
     });
 
-    const termuxRes = await apiFetch("/api/tts/config", {
-      method: "POST",
-      body: JSON.stringify({ ...termuxPayload, persistScope })
-    });
-
     if (settingsRes?.ok) {
       applySettingsToForm(settingsRes.settings);
+      if (nextAdminToken) {
+        persistLocalAdminToken(nextAdminToken, { reconnect: true, syncInput: true });
+      }
     }
 
-    if (termuxRes?.effective) {
-      applyTermuxForm(termuxRes.effective, termuxRes.persistScope || persistScope);
+    if (settingsRes?.termuxConfig?.effective) {
+      applyTermuxForm(settingsRes.termuxConfig.effective, settingsRes.termuxConfig.persistScope || persistScope);
     }
 
-    renderTermuxValidationResult(termuxRes?.validation || termuxValidation);
+    renderTermuxValidationResult(settingsRes?.termuxValidation);
 
-    if (termuxRes?.audioBehavior?.effectiveStream) {
-      const notes = Array.isArray(termuxRes.audioBehavior.notes) ? termuxRes.audioBehavior.notes : [];
-      setTermuxAudioNote(`Stream efectivo: ${termuxRes.audioBehavior.effectiveStream}${notes.length ? ` | ${notes[0]}` : ""}`);
+    if (settingsRes?.audioBehavior?.effectiveStream) {
+      const notes = Array.isArray(settingsRes.audioBehavior.notes) ? settingsRes.audioBehavior.notes : [];
+      setTermuxAudioNote(`Stream efectivo: ${settingsRes.audioBehavior.effectiveStream}${notes.length ? ` | ${notes[0]}` : ""}`);
     }
 
-    setSettingsStatus("Opciones guardadas.", "ok");
+    const restartFields = Array.isArray(settingsRes?.restartFields) && settingsRes.restartFields.length > 0
+      ? settingsRes.restartFields
+      : (Array.isArray(settingsRes?.settings?.restartFields) ? settingsRes.settings.restartFields : []);
+
+    if (settingsRes?.restartRequired || settingsRes?.settings?.restartRequired) {
+      setSettingsStatus(`Opciones guardadas. Reinicia el servidor para aplicar ${restartFields.join(", ") || "bindHost/port"}.`, "warn");
+    } else {
+      setSettingsStatus("Opciones guardadas.", "ok");
+    }
   } catch (e) {
-    setSettingsStatus(`Error guardando opciones: ${String(e.message || e)}`, "error");
+    if (e?.body?.termuxValidation) {
+      renderTermuxValidationResult(e.body.termuxValidation);
+    }
+    const detail = formatValidationErrors(e?.body?.errors) || String(e.message || e);
+    setSettingsStatus(`Error guardando opciones: ${detail}`, "error");
   }
+});
+
+on(saveAdminTokenLocal, "click", async () => {
+  const token = normalizeAdminTokenInput(optAdminToken?.value || "");
+  if (!token) {
+    setAuthStatus("Ingresa un admin token antes de guardarlo localmente.", "warn");
+    return;
+  }
+
+  persistLocalAdminToken(token, { reconnect: true, syncInput: true });
+  setAuthStatus("Token local guardado. Reintentando cargar datos protegidos.", "ok");
+  await loadSettings();
+  await loadLists();
+  await loadTikTokStatus();
+});
+
+on(clearAdminTokenLocal, "click", async () => {
+  persistLocalAdminToken("", { reconnect: true, syncInput: false });
+  if (optAdminToken) optAdminToken.value = "";
+  setAuthStatus("Token local borrado.", "info");
+  await loadSettings();
 });
 
 on(reloadSettings, "click", async () => {
@@ -1193,6 +1436,13 @@ on(refreshVoices, "click", async () => {
 });
 
 // -------------------- init --------------------
+if (optAdminToken) {
+  const storedToken = getClientAdminToken();
+  if (storedToken) optAdminToken.value = storedToken;
+}
+refreshAuthStatus();
+syncSocketAuth(false);
+socket.connect();
 loadLists();
 loadSettings();
 loadTikTokStatus();

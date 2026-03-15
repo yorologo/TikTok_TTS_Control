@@ -1,0 +1,38 @@
+{
+  "tiktokUsername": "TU_USUARIO_SIN_ARROBA",
+  "bindHost": "127.0.0.1",
+  "port": 8787,
+  "adminToken": "",
+  "ttsEnabled": true,
+  "globalCooldownMs": 9000,
+  "perUserCooldownMs": 30000,
+  "maxQueue": 6,
+  "maxChars": 80,
+  "maxWords": 14,
+  "historySize": 25,
+  "ttsEngine": "termux",
+  "ttsVoice": "",
+  "ttsRate": 1,
+  "piper": {
+    "modelPath": "",
+    "lengthScale": 1,
+    "volume": 1,
+    "pythonCmd": "python"
+  },
+  "termux": {
+    "engine": "",
+    "language": "es",
+    "region": "MX",
+    "variant": "",
+    "pitch": 1,
+    "rate": 1,
+    "stream": "MUSIC",
+    "outputMode": "media",
+    "coexistenceMode": "duck"
+  },
+  "autoBan": {
+    "enabled": true,
+    "strikeThreshold": 2,
+    "banMinutes": 30
+  }
+}
