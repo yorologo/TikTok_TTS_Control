@@ -30,6 +30,11 @@ import {
   extractTermuxConfigInput,
   getPersistScope
 } from "./modules/common.js";
+import {
+  buildRuntimeSnapshot,
+  commandExistsSync as runtimeCommandExistsSync,
+  getRecommendedTtsEngine
+} from "./modules/runtime.js";
 import { createPersistenceModule } from "./modules/persistence.js";
 import { createModerationModule } from "./modules/moderation.js";
 import { createTtsModule } from "./modules/tts.js";
@@ -67,59 +72,32 @@ const TTS_TEST_MAX_LEN = 220;
 const TERMUX_DEFAULT_STREAM = "MUSIC";
 const TTS_CMD_TIMEOUT_MS = 90000;
 
-function commandExistsSync(cmd) {
-  if (!cmd) return false;
-  const pathValue = process.env.PATH || "";
-  for (const dir of pathValue.split(path.delimiter)) {
-    if (!dir) continue;
-    try {
-      fs.accessSync(path.join(dir, cmd), fs.constants.X_OK);
-      return true;
-    } catch {}
-  }
-  return false;
-}
-
 const RUNTIME_CAPS = Object.freeze({
   platform: process.platform,
   isTermux: process.platform === "android" || String(process.env.PREFIX || "").includes("com.termux"),
-  hasTermuxTts: commandExistsSync("termux-tts-speak"),
-  hasTermuxTtsEngines: commandExistsSync("termux-tts-engines"),
-  hasTermuxMediaPlayer: commandExistsSync("termux-media-player"),
-  hasAplay: commandExistsSync("aplay"),
-  hasPaplay: commandExistsSync("paplay"),
-  hasAfplay: commandExistsSync("afplay"),
-  hasPowerShell: commandExistsSync("powershell")
+  hasTermuxTts: runtimeCommandExistsSync(fs, path, "termux-tts-speak"),
+  hasTermuxTtsEngines: runtimeCommandExistsSync(fs, path, "termux-tts-engines"),
+  hasTermuxMediaPlayer: runtimeCommandExistsSync(fs, path, "termux-media-player"),
+  hasAplay: runtimeCommandExistsSync(fs, path, "aplay"),
+  hasPaplay: runtimeCommandExistsSync(fs, path, "paplay"),
+  hasAfplay: runtimeCommandExistsSync(fs, path, "afplay"),
+  hasPowerShell: runtimeCommandExistsSync(fs, path, "powershell")
 });
 
-function getRecommendedEngine() {
-  if (RUNTIME_CAPS.hasTermuxTts) return "termux";
-  if (RUNTIME_CAPS.platform === "win32" || RUNTIME_CAPS.platform === "darwin" || RUNTIME_CAPS.platform === "linux") {
-    return "say";
-  }
-  return "piper";
-}
-
-function getAvailableEngines() {
-  const out = ["piper"];
-  if (RUNTIME_CAPS.hasTermuxTts) out.push("termux");
-  if (RUNTIME_CAPS.platform !== "android") out.push("say");
-  return out;
-}
+const DEFAULT_TTS_ENGINE = getRecommendedTtsEngine({ runtimeCaps: RUNTIME_CAPS });
+const DEFAULT_PIPER_PYTHON_CMD = process.platform === "win32" ? "py" : "python";
 
 function getRuntimeSnapshot() {
-  return {
-    platform: RUNTIME_CAPS.platform,
-    isTermux: !!RUNTIME_CAPS.isTermux,
-    hasTermuxTts: !!RUNTIME_CAPS.hasTermuxTts,
-    hasTermuxTtsEngines: !!RUNTIME_CAPS.hasTermuxTtsEngines,
-    availableTtsEngines: getAvailableEngines(),
-    recommendedTtsEngine: getRecommendedEngine()
-  };
+  return buildRuntimeSnapshot({
+    fs,
+    path,
+    rootDir: __dirname,
+    settings: state?.settings || DEFAULT_SETTINGS,
+    runtimeCaps: RUNTIME_CAPS,
+    defaultPythonCmd: DEFAULT_PIPER_PYTHON_CMD,
+    commandExists: (cmd) => runtimeCommandExistsSync(fs, path, cmd)
+  });
 }
-
-const DEFAULT_TTS_ENGINE = getRecommendedEngine();
-const DEFAULT_PIPER_PYTHON_CMD = process.platform === "win32" ? "py" : "python";
 
 const DEFAULT_SETTINGS = {
   tiktokUsername: "TU_USUARIO_SIN_ARROBA",

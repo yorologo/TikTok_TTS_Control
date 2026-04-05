@@ -114,7 +114,7 @@ sequenceDiagram
 ## Requisitos
 
 ### Base
-- Node.js 18+
+- Node.js 20+
 - `npm install`
 
 ### Para Termux/Android

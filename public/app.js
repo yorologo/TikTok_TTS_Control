@@ -147,6 +147,7 @@ const optTtsVoice = qs("optTtsVoice");
 
 const saySettings = qs("saySettings");
 const piperSettings = qs("piperSettings");
+const piperStatus = qs("piperStatus");
 
 const optPiperModelPath = qs("optPiperModelPath");
 const optPiperLengthScale = qs("optPiperLengthScale");
@@ -527,6 +528,10 @@ async function loadTtsConfig() {
 function renderRuntime(runtime) {
   if (!runtimeStatus || !runtime) return;
 
+  if (latestSettingsSnapshot) {
+    latestSettingsSnapshot = { ...latestSettingsSnapshot, runtime };
+  }
+
   const engines = Array.isArray(runtime.availableTtsEngines)
     ? runtime.availableTtsEngines.join(", ")
     : "-";
@@ -538,6 +543,7 @@ function renderRuntime(runtime) {
     : "";
 
   runtimeStatus.textContent = `Runtime: ${runtime.platform}${runtime.isTermux ? " (Termux)" : ""} | Motores: ${engines} | Recomendado: ${runtime.recommendedTtsEngine || "-"}${bindingText}`;
+  renderPiperRuntimeStatus(runtime.piper);
 }
 
 function setTtsEngineState(engine) {
@@ -550,6 +556,44 @@ function setTtsEngineState(engine) {
   if (useTermux) {
     setVoicesStatus("Termux API activo.", "info");
   }
+
+  if (usePiper) {
+    renderPiperRuntimeStatus(latestSettingsSnapshot?.runtime?.piper || null);
+  }
+}
+
+function formatPiperIssue(issue) {
+  switch (issue) {
+    case "python_not_found":
+      return "pythonCmd no encontrado";
+    case "piper_model_missing":
+      return "falta modelPath";
+    case "piper_model_not_found":
+      return "modelo .onnx no existe";
+    case "no_audio_player_for_piper":
+      return "sin reproductor WAV compatible";
+    default:
+      return issue || "estado_desconocido";
+  }
+}
+
+function renderPiperRuntimeStatus(piper) {
+  if (!piperStatus) return;
+  if (!piper) {
+    piperStatus.textContent = "";
+    return;
+  }
+
+  const issues = Array.isArray(piper.issues) ? piper.issues.map(formatPiperIssue) : [];
+
+  if (piper.ready) {
+    piperStatus.textContent = `Piper listo | Python: ${piper.pythonCmd} | Audio: ${piper.audioPlayer || "-"}`;
+    return;
+  }
+
+  const issueText = issues.length > 0 ? issues.join(" | ") : "configuracion incompleta";
+  const modelText = piper.modelConfigured && piper.modelPath ? ` | Modelo: ${piper.modelPath}` : "";
+  piperStatus.textContent = `Piper pendiente | ${issueText}${modelText}`;
 }
 
 function formatHistoryTime(ts) {
